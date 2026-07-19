@@ -1,0 +1,28 @@
+# AI Auditor configuration
+# =========================
+# This file makes the Trust Score genuinely configurable, as the paper describes.
+# The Trust Score is a WEIGHTED mean of three phase sub-scores:
+#
+#     trust = (w_h * halluc_sub + w_i * instr_sub + w_q * quality_sub)
+#             / (w_h + w_i + w_q)          # weights are auto-normalised
+#
+# Change the weights below and re-run to reproduce the weight-sensitivity analysis.
+# When a phase is not available for a sample (e.g. no instructions supplied), it is
+# dropped and the remaining weights re-normalise, so the score stays well-defined.
+
+trust_score_weights:
+  hallucination: 0.3333      # weight on the hallucination sub-score
+  instruction:   0.3333      # weight on the instruction-adherence sub-score
+  quality:       0.3334      # weight on the code-quality sub-score
+
+# Penalty per TRUE hallucination when forming the hallucination sub-score
+# (halluc_sub = max(0, 100 - hallucination_penalty * true_hallucination_count)).
+hallucination_penalty: 25
+
+# Quality-score penalty coefficients. These are the SAME constants used in
+# src/quality.py and quoted by the paper's Equation (1). Kept here so the
+# coefficient-sensitivity analysis can vary them from one place.
+quality_penalties:
+  security:  15
+  dead_code: 5
+  code_smell: 3

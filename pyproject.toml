@@ -1,0 +1,35 @@
+[project]
+name = "ai-auditor"
+version = "0.1.0"
+description = "Unified Verification for AI-Generated Content"
+authors = [
+    {name = "Kasmya",email = "kasmyakyreen@gmail.com"}
+]
+license = "MIT"
+readme = "README.md"
+requires-python = ">=3.13,<4"
+dependencies = [
+    "llmauditor>=1.1.0",
+    "ai-code-validator (>=0.1.0)",
+    "codepolish (>=0.1.0)",
+    "openai (>=1.0.0)",
+    "anthropic (>=0.18.0)",
+    "rich (>=13.0.0)",
+    "click (>=8.0.0)",
+    "python-dotenv (>=1.0.0)",
+    "pydantic (>=2.0.0)"
+]
+
+
+[build-system]
+requires = ["poetry-core>=2.0.0,<3.0.0"]
+build-backend = "poetry.core.masonry.api"
+
+[dependency-groups]
+dev = [
+    "pytest (>=7.0.0)",
+    "pytest-cov (>=4.0.0)",
+    "black (>=23.0.0)",
+    "isort (>=5.12.0)",
+    "mypy (>=1.0.0)"
+]

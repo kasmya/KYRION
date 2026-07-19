@@ -1,0 +1,8 @@
+metric,value
+tp,45
+fp,0
+tn,48
+fn,1
+precision,1.0
+recall,0.9783
+f1,0.989
