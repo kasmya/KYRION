@@ -1,0 +1,8 @@
+{
+  "model": "openai__gpt-oss-120b",
+  "task": "task02",
+  "run": 2,
+  "model_version": "unknown",
+  "collected_at": "unknown",
+  "source": "nvidia-nim"
+}

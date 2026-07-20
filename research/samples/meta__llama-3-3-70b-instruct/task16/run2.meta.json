@@ -1,0 +1,8 @@
+{
+  "model": "meta__llama-3-3-70b-instruct",
+  "task": "task16",
+  "run": 2,
+  "model_version": "unknown",
+  "collected_at": "unknown",
+  "source": "nvidia-nim"
+}

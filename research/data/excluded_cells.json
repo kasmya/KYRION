@@ -1,0 +1,170 @@
+[
+  {
+    "model": "mistralai__mistral-large-3-675b-instruct-2512",
+    "task": "task01",
+    "n": 0,
+    "reason": "below min_k=2"
+  },
+  {
+    "model": "mistralai__mistral-large-3-675b-instruct-2512",
+    "task": "task02",
+    "n": 0,
+    "reason": "below min_k=2"
+  },
+  {
+    "model": "mistralai__mistral-large-3-675b-instruct-2512",
+    "task": "task03",
+    "n": 0,
+    "reason": "below min_k=2"
+  },
+  {
+    "model": "mistralai__mistral-large-3-675b-instruct-2512",
+    "task": "task04",
+    "n": 1,
+    "reason": "below min_k=2"
+  },
+  {
+    "model": "mistralai__mistral-large-3-675b-instruct-2512",
+    "task": "task05",
+    "n": 0,
+    "reason": "below min_k=2"
+  },
+  {
+    "model": "mistralai__mistral-large-3-675b-instruct-2512",
+    "task": "task06",
+    "n": 0,
+    "reason": "below min_k=2"
+  },
+  {
+    "model": "mistralai__mistral-large-3-675b-instruct-2512",
+    "task": "task07",
+    "n": 0,
+    "reason": "below min_k=2"
+  },
+  {
+    "model": "mistralai__mistral-large-3-675b-instruct-2512",
+    "task": "task08",
+    "n": 0,
+    "reason": "below min_k=2"
+  },
+  {
+    "model": "mistralai__mistral-large-3-675b-instruct-2512",
+    "task": "task09",
+    "n": 0,
+    "reason": "below min_k=2"
+  },
+  {
+    "model": "mistralai__mistral-large-3-675b-instruct-2512",
+    "task": "task10",
+    "n": 0,
+    "reason": "below min_k=2"
+  },
+  {
+    "model": "mistralai__mistral-large-3-675b-instruct-2512",
+    "task": "task11",
+    "n": 0,
+    "reason": "below min_k=2"
+  },
+  {
+    "model": "mistralai__mistral-large-3-675b-instruct-2512",
+    "task": "task12",
+    "n": 0,
+    "reason": "below min_k=2"
+  },
+  {
+    "model": "mistralai__mistral-large-3-675b-instruct-2512",
+    "task": "task13",
+    "n": 0,
+    "reason": "below min_k=2"
+  },
+  {
+    "model": "mistralai__mistral-large-3-675b-instruct-2512",
+    "task": "task14",
+    "n": 0,
+    "reason": "below min_k=2"
+  },
+  {
+    "model": "mistralai__mistral-large-3-675b-instruct-2512",
+    "task": "task15",
+    "n": 0,
+    "reason": "below min_k=2"
+  },
+  {
+    "model": "mistralai__mistral-large-3-675b-instruct-2512",
+    "task": "task16",
+    "n": 0,
+    "reason": "below min_k=2"
+  },
+  {
+    "model": "mistralai__mistral-large-3-675b-instruct-2512",
+    "task": "task17",
+    "n": 0,
+    "reason": "below min_k=2"
+  },
+  {
+    "model": "mistralai__mistral-large-3-675b-instruct-2512",
+    "task": "task18",
+    "n": 0,
+    "reason": "below min_k=2"
+  },
+  {
+    "model": "mistralai__mistral-large-3-675b-instruct-2512",
+    "task": "task19",
+    "n": 0,
+    "reason": "below min_k=2"
+  },
+  {
+    "model": "mistralai__mistral-large-3-675b-instruct-2512",
+    "task": "task20",
+    "n": 0,
+    "reason": "below min_k=2"
+  },
+  {
+    "model": "openai__gpt-oss-120b",
+    "task": "task07",
+    "n": 1,
+    "reason": "below min_k=2"
+  },
+  {
+    "model": "openai__gpt-oss-120b",
+    "task": "task12",
+    "n": 0,
+    "reason": "below min_k=2"
+  },
+  {
+    "model": "openai__gpt-oss-120b",
+    "task": "task14",
+    "n": 0,
+    "reason": "below min_k=2"
+  },
+  {
+    "model": "openai__gpt-oss-120b",
+    "task": "task15",
+    "n": 1,
+    "reason": "below min_k=2"
+  },
+  {
+    "model": "openai__gpt-oss-120b",
+    "task": "task16",
+    "n": 0,
+    "reason": "below min_k=2"
+  },
+  {
+    "model": "openai__gpt-oss-120b",
+    "task": "task17",
+    "n": 0,
+    "reason": "below min_k=2"
+  },
+  {
+    "model": "openai__gpt-oss-120b",
+    "task": "task18",
+    "n": 1,
+    "reason": "below min_k=2"
+  },
+  {
+    "model": "openai__gpt-oss-120b",
+    "task": "task19",
+    "n": 1,
+    "reason": "below min_k=2"
+  }
+]

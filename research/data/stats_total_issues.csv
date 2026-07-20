@@ -1,0 +1,11 @@
+model_a,model_b,U,p_raw,p_holm,cliffs_delta,magnitude
+deepseek-ai__deepseek-v4-flash,meta__llama-3-1-70b-instruct,213.5,0.723578069004831,1.0,0.0675,negligible
+deepseek-ai__deepseek-v4-flash,meta__llama-3-3-70b-instruct,254.5,0.14211718153336725,1.0,0.2725,small
+deepseek-ai__deepseek-v4-flash,nvidia__llama-3-3-nemotron-super-49b-v1,254.0,0.1459610134673585,1.0,0.27,small
+deepseek-ai__deepseek-v4-flash,openai__gpt-oss-120b,274.5,0.04429828976573787,0.44298289765737864,0.3725,medium
+meta__llama-3-1-70b-instruct,meta__llama-3-3-70b-instruct,235.5,0.34167282048548453,1.0,0.1775,small
+meta__llama-3-1-70b-instruct,nvidia__llama-3-3-nemotron-super-49b-v1,232.5,0.38392799278631706,1.0,0.1625,small
+meta__llama-3-1-70b-instruct,openai__gpt-oss-120b,258.0,0.11860409542432979,1.0,0.29,small
+meta__llama-3-3-70b-instruct,nvidia__llama-3-3-nemotron-super-49b-v1,193.5,0.8705930035222689,1.0,-0.0325,negligible
+meta__llama-3-3-70b-instruct,openai__gpt-oss-120b,233.5,0.3702639204415803,1.0,0.1675,small
+nvidia__llama-3-3-nemotron-super-49b-v1,openai__gpt-oss-120b,233.5,0.37060285300609863,1.0,0.1675,small

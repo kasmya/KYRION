@@ -1,0 +1,201 @@
+from reportlab.lib import colors
+from reportlab.lib.pagesizes import letter
+from reportlab.lib.styles import getSampleStyleSheet, ParagraphStyle
+from reportlab.lib.units import inch
+from reportlab.platypus import (
+    SimpleDocTemplate,
+    Table,
+    TableStyle,
+    Paragraph,
+    PageBreak,
+    Flowable,
+    Spacer
+)
+from reportlab.graphics.charts.barrender import BarChart
+from reportlab.graphics.charts.linechart import LineChart
+from reportlab.graphics.charts.piechart import PieChart
+from reportlab.graphics.shapes import Drawing
+from typing import List, Dict, Tuple
+import os
+
+class PDFReportGenerator:
+    """
+    Generates PDF reports with header, footer, tables, charts, and multi-page support.
+    """
+    
+    def __init__(self, output_path: str, page_size: Tuple[float, float] = letter):
+        """
+        Initializes the PDF report generator.
+
+        Args:
+        - output_path (str): Path to save the generated PDF report.
+        - page_size (Tuple[float, float], optional): Page size of the report. Defaults to letter size.
+        """
+        self.output_path = output_path
+        self.page_size = page_size
+        self.styles = getSampleStyleSheet()
+        self.styles.add(ParagraphStyle(name='Header', fontSize=18, leading=20, alignment=1))
+        self.styles.add(ParagraphStyle(name='Footer', fontSize=12, leading=12, alignment=1))
+
+    def _build_header(self, canvas) -> None:
+        """
+        Builds the header of the report.
+
+        Args:
+        - canvas: ReportLab canvas object.
+        """
+        canvas.saveState()
+        canvas.setFont("Helvetica-Bold", 18)
+        canvas.drawString(1 * inch, 10.5 * inch, "Report Header")
+        canvas.restoreState()
+
+    def _build_footer(self, canvas, num_pages: int) -> None:
+        """
+        Builds the footer of the report.
+
+        Args:
+        - canvas: ReportLab canvas object.
+        - num_pages (int): Total number of pages in the report.
+        """
+        canvas.saveState()
+        canvas.setFont("Helvetica", 12)
+        canvas.drawString(1 * inch, 0.5 * inch, f"Page {canvas.getPageNumber()} of {num_pages}")
+        canvas.restoreState()
+
+    def _generate_table(self, data: List[List[str]]) -> Table:
+        """
+        Generates a table from the given data.
+
+        Args:
+        - data (List[List[str]]): 2D list of strings representing table data.
+
+        Returns:
+        - Table: ReportLab Table object.
+        """
+        table = Table(data, colWidths=[2 * inch] * len(data[0]))
+        table_style = TableStyle([
+            ('BACKGROUND', (0, 0), (-1, 0), colors.grey),
+            ('TEXTCOLOR', (0, 0), (-1, 0), colors.whitesmoke),
+            ('ALIGN', (0, 0), (-1, -1), 'CENTER'),
+            ('FONTNAME', (0, 0), (-1, 0), 'Helvetica-Bold'),
+            ('FONTSIZE', (0, 0), (-1, -1), 12),
+            ('BOTTOMPADDING', (0, 0), (-1, 0), 12),
+            ('TOPPADDING', (0, 1), (-1, -1), 12),
+            ('GRID', (0, 0), (-1, -1), 1, colors.black),
+        ])
+        table.setStyle(table_style)
+        return table
+
+    def _generate_chart(self, chart_type: str, data: Dict[str, List[float]]) -> Drawing:
+        """
+        Generates a chart from the given data.
+
+        Args:
+        - chart_type (str): Type of chart (bar, line, pie).
+        - data (Dict[str, List[float]]): Dictionary with series names as keys and lists of values as values.
+
+        Returns:
+        - Drawing: ReportLab Drawing object.
+        """
+        if chart_type == 'bar':
+            chart = BarChart()
+            chart.categoryAxis().loLabelPadding = 10
+            chart.valueAxis().loLabelPadding = 10
+            chart.style.sheet.styleSheet.defaultFont = 'Helvetica'
+            chart.data = list(data.values())
+            chart.width = 400
+            chart.height = 200
+            chart.stackBars = True
+        elif chart_type == 'line':
+            chart = LineChart()
+            chart.categoryAxis().loLabelPadding = 10
+            chart.valueAxis().loLabelPadding = 10
+            chart.style.sheet.styleSheet.defaultFont = 'Helvetica'
+            chart.data = list(data.values())
+            chart.width = 400
+            chart.height = 200
+        elif chart_type == 'pie':
+            chart = PieChart()
+            chart.style.sheet.styleSheet.defaultFont = 'Helvetica'
+            chart.data = data['values']
+            chart.width = 200
+            chart.height = 200
+            chart.showValues = 1
+            chart.shadowSpacing = 3
+        else:
+            raise ValueError("Invalid chart type. Supported types: bar, line, pie.")
+        
+        drawing = Drawing(300, 200)
+        drawing.add(chart)
+        return drawing
+
+    def generate_report(
+        self, 
+        header_text: str, 
+        tables: List[List[List[str]]], 
+        charts: List[Tuple[str, Dict[str, List[float]]]], 
+        footer_text: str = "Generated by PDFReportGenerator"
+    ) -> None:
+        """
+        Generates the PDF report.
+
+        Args:
+        - header_text (str): Text to display in the header.
+        - tables (List[List[List[str]]]): List of 2D lists of strings representing table data.
+        - charts (List[Tuple[str, Dict[str, List[float]]]]): List of tuples containing chart type and data.
+        - footer_text (str, optional): Text to display in the footer. Defaults to "Generated by PDFReportGenerator".
+        """
+        if os.path.exists(self.output_path):
+            os.remove(self.output_path)
+        
+        elements = []
+        elements.append(Paragraph(header_text, self.styles['Header']))
+        
+        for table in tables:
+            elements.append(self._generate_table(table))
+            elements.append(Spacer(1, 12))
+        
+        for chart_type, chart_data in charts:
+            elements.append(self._generate_chart(chart_type, chart_data))
+            elements.append(Spacer(1, 12))
+        
+        if len(elements) > 30:  # Simplified page count estimation
+            for _ in range(len(elements) // 30):
+                elements.insert((_ + 1) * 30, PageBreak())
+        
+        doc = SimpleDocTemplate(self.output_path, pagesize=self.page_size)
+        doc.build(elements, onFirstPage=self._build_header, onLaterPages=self._build_header, canvasmaker=self._footer_canvas_factory(footer_text))
+
+    def _footer_canvas_factory(self, footer_text: str):
+        """
+        Factory method for creating a canvas with a footer.
+
+        Args:
+        - footer_text (str): Text to display in the footer.
+
+        Returns:
+        - Function: Canvas factory function.
+        """
+        def canvas_factory(canvas):
+            self._build_footer(canvas, 1)  # Simplified page count
+            canvas.setFont("Helvetica", 12)
+            canvas.drawString(1 * inch, 1 * inch, footer_text)
+            return canvas
+        return canvas_factory
+
+# Example usage
+if __name__ == "__main__":
+    generator = PDFReportGenerator("example_report.pdf")
+    
+    tables = [
+        [["Column 1", "Column 2"], ["Cell 1", "Cell 2"], ["Cell 3", "Cell 4"]],
+        [["Column A", "Column B"], ["Value 1", "Value 2"], ["Value 3", "Value 4"]]
+    ]
+    
+    charts = [
+        ("bar", {"Series 1": [10, 20, 30], "Series 2": [40, 50, 60]}),
+        ("line", {"Series A": [100, 200, 300], "Series B": [400, 500, 600]}),
+        ("pie", {"values": [10, 20, 30, 40]})
+    ]
+    
+    generator.generate_report("Example Report Header", tables, charts, "Example Footer Text")
