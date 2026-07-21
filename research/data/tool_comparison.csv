@@ -2,4 +2,4 @@ tool,security,hallucination,dead_code,quality_style
 Bandit,219,0,0,0
 Ruff,0,0,490,65
 Pylint,3,159,438,3087
-KYRION,55,57,490,733
+KYRION,55,0,490,733

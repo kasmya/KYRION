@@ -127,6 +127,12 @@ def main(metric: str, unit: str):
 
     # 2. Kruskal-Wallis omnibus
     print(f"\n2) KRUSKAL-WALLIS omnibus test (are the {len(models)} models different?)\n")
+    all_vals = [v for m in models for v in data[m]]
+    if len(set(all_vals)) <= 1:
+        print("   All values identical across models (no variance).")
+        print("   => Models are trivially indistinguishable on this metric.")
+        print(f"   (Every model scored {all_vals[0] if all_vals else 0} on every task.)")
+        return
     h, p_kw = stats.kruskal(*[data[m] for m in models])
     print(f"   H = {h:.3f},  p = {p_kw:.3e}")
     if p_kw < 0.05:
