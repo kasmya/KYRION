@@ -1,8 +1,0 @@
-{
-  "model": "nvidia__llama-3_3-nemotron-super-49b-v1",
-  "task": "task06",
-  "run": 1,
-  "model_version": "unknown",
-  "collected_at": "unknown",
-  "source": "nvidia-nim"
-}

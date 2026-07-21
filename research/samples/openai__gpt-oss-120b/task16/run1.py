@@ -1,285 +1,296 @@
-#!/usr/bin/env python3
 """
-Image Processor Module
+image_processor.py
 
-Provides utilities to resize images, convert between JPEG/PNG/WebP,
-apply basic filters (blur, sharpen, edge detection) and batch‑process
-multiple files safely.
+A small, self‑contained image processing module that provides functions for
+resizing, format conversion, applying simple filters (blur, sharpen,
+edge‑detection) and batch‑processing an entire folder.
 
-Only Pillow (PIL) and the Python standard library are required.
+Only the Pillow library (PIL) is required in addition to the Python
+standard library.
 """
 
 from __future__ import annotations
 
 import os
-import sys
-import logging
 from pathlib import Path
-from typing import Iterable, List, Tuple, Union, Callable, Optional
-
-from enum import Enum, auto
+from typing import Callable, List, Optional, Tuple
 
 from PIL import Image, ImageFilter, UnidentifiedImageError
 
 # --------------------------------------------------------------------------- #
-# Configuration & Logging
+# Public constants
 # --------------------------------------------------------------------------- #
 
-logging.basicConfig(
-    level=logging.INFO,
-    format="%(asctime)s %(levelname)s %(message)s",
-    handlers=[logging.StreamHandler(sys.stderr)],
-)
-
-logger = logging.getLogger(__name__)
-
-# --------------------------------------------------------------------------- #
-# Enums & Type Aliases
-# --------------------------------------------------------------------------- #
-
-class ImageFormat(str, Enum):
-    JPEG = "JPEG"
-    PNG = "PNG"
-    WEBP = "WEBP"
-
-
-class FilterType(str, Enum):
-    BLUR = "blur"
-    SHARPEN = "sharpen"
-    EDGE_ENHANCE = "edge_enhance"
-
-
-# Mapping from FilterType to Pillow filter objects
-_FILTER_MAP: dict[FilterType, Callable[[], ImageFilter.Filter]] = {
-    FilterType.BLUR: ImageFilter.BLUR,
-    FilterType.SHARPEN: ImageFilter.SHARPEN,
-    FilterType.EDGE_ENHANCE: ImageFilter.FIND_EDGES,
+ALLOWED_EXTENSIONS = {".jpg", ".jpeg", ".png", ".webp"}
+ALLOWED_FORMATS = {"JPEG", "PNG", "WEBP"}
+FILTER_MAP: dict[str, Callable[[Image.Image], Image.Image]] = {
+    "blur": lambda img: img.filter(ImageFilter.BLUR),
+    "sharpen": lambda img: img.filter(ImageFilter.SHARPEN),
+    "edge": lambda img: img.filter(ImageFilter.FIND_EDGES),
 }
-
 
 # --------------------------------------------------------------------------- #
 # Exceptions
 # --------------------------------------------------------------------------- #
 
+
 class ImageProcessingError(RuntimeError):
-    """Base class for errors raised by ImageProcessor."""
+    """Base exception for all errors raised by this module."""
 
 
 # --------------------------------------------------------------------------- #
-# Helper Functions
+# Helper functions
 # --------------------------------------------------------------------------- #
 
-def _safe_path(path: Union[str, Path]) -> Path:
+
+def _ensure_path_is_image(path: Path) -> None:
     """
-    Resolve a filesystem path safely to avoid path‑traversal attacks.
-
-    Args:
-        path: Input path as string or Path.
-
-    Returns:
-        A normalized absolute Path object.
-    """
-    p = Path(path).expanduser().resolve()
-    return p
-
-
-def _ensure_directory(path: Path) -> None:
-    """
-    Ensure that the directory for *path* exists.
-
-    Args:
-        path: Destination file path.
+    Validate that *path* points to an existing file with an allowed image
+    extension.
 
     Raises:
-        ImageProcessingError: If the directory cannot be created.
+        ImageProcessingError: If the path does not exist, is not a file,
+            or has an unsupported extension.
     """
+    if not path.is_file():
+        raise ImageProcessingError(f"Path '{path}' is not a file.")
+    if path.suffix.lower() not in ALLOWED_EXTENSIONS:
+        raise ImageProcessingError(
+            f"File '{path}' has an unsupported extension. "
+            f"Supported: {sorted(ALLOWED_EXTENSIONS)}"
+        )
+
+
+def _safe_output_path(
+    output_dir: Path, original_name: str, target_format: Optional[str] = None
+) -> Path:
+    """
+    Construct a safe output file path inside *output_dir*.
+
+    The function normalises the path, ensures the result is a child of
+    *output_dir* (preventing directory‑traversal attacks) and adds the
+    appropriate file extension if *target_format* is supplied.
+
+    Returns:
+        Path: The resolved output file path.
+
+    Raises:
+        ImageProcessingError: If the resolved path escapes *output_dir*.
+    """
+    output_dir = output_dir.resolve()
+    stem = Path(original_name).stem
+    ext = f".{target_format.lower()}" if target_format else Path(original_name).suffix
+    candidate = (output_dir / f"{stem}{ext}").resolve()
+    if output_dir not in candidate.parents:
+        raise ImageProcessingError("Attempted to write outside the output directory.")
+    return candidate
+
+
+# --------------------------------------------------------------------------- #
+# Core processing functions
+# --------------------------------------------------------------------------- #
+
+
+def resize_image(
+    input_path: Path,
+    output_path: Path,
+    size: Tuple[int, int],
+    *,
+    resample: int = Image.LANCZOS,
+) -> None:
+    """
+    Resize an image to *size* and write the result to *output_path*.
+
+    Args:
+        input_path: Path to the source image.
+        output_path: Destination path for the resized image.
+        size: Desired width and height (width, height).
+        resample: Resampling filter to use (default: Image.LANCZOS).
+
+    Raises:
+        ImageProcessingError: If the image cannot be opened, processed,
+            or saved.
+    """
+    _ensure_path_is_image(input_path)
     try:
-        path.parent.mkdir(parents=True, exist_ok=True)
-    except OSError as exc:
-        raise ImageProcessingError(f"Unable to create directory {path.parent}: {exc}") from exc
-
-
-# --------------------------------------------------------------------------- #
-# Core Processor
-# --------------------------------------------------------------------------- #
-
-class ImageProcessor:
-    """
-    High‑level wrapper around Pillow to perform common image operations
-    with type hints, error handling and security‑focused path handling.
-    """
-
-    def __init__(self, *, keep_exif: bool = True) -> None:
-        """
-        Initialize the processor.
-
-        Args:
-            keep_exif: Whether to preserve EXIF metadata on format conversion.
-        """
-        self.keep_exif = keep_exif
-
-    # ------------------------------------------------------------------- #
-    # Core operations
-    # ------------------------------------------------------------------- #
-
-    @staticmethod
-    def _load_image(src: Path) -> Image.Image:
-        """
-        Load an image from disk.
-
-        Args:
-            src: Path to source image.
-
-        Returns:
-            Pillow Image object.
-
-        Raises:
-            ImageProcessingError: If the file cannot be opened or is not an image.
-        """
-        try:
-            img = Image.open(src)
-            img.load()  # Force loading to catch truncated files early
-            return img
-        except (OSError, UnidentifiedImageError) as exc:
-            raise ImageProcessingError(f"Failed to open image {src}: {exc}") from exc
-
-    def resize(
-        self,
-        src: Union[str, Path],
-        dest: Union[str, Path],
-        size: Tuple[int, int],
-        *,
-        resample: int = Image.LANCZOS,
-    ) -> None:
-        """
-        Resize an image to the given dimensions.
-
-        Args:
-            src: Source image path.
-            dest: Destination path.
-            size: Desired (width, height) in pixels.
-            resample: Resampling filter (default: LANCZOS).
-
-        Raises:
-            ImageProcessingError: On I/O or processing failure.
-        """
-        src_path = _safe_path(src)
-        dest_path = _safe_path(dest)
-
-        logger.debug("Resizing %s -> %s to %s", src_path, dest_path, size)
-
-        try:
-            img = self._load_image(src_path)
+        with Image.open(input_path) as img:
             resized = img.resize(size, resample=resample)
-            _ensure_directory(dest_path)
-            save_kwargs = {}
-            if self.keep_exif and "exif" in img.info:
-                save_kwargs["exif"] = img.info["exif"]
-            resized.save(dest_path, **save_kwargs)
-        except Exception as exc:
-            raise ImageProcessingError(f"Resize failed for {src_path}: {exc}") from exc
+            resized.save(output_path)
+    except (UnidentifiedImageError, OSError) as exc:
+        raise ImageProcessingError(
+            f"Failed to resize image '{input_path}': {exc}"
+        ) from exc
 
-    def convert_format(
-        self,
-        src: Union[str, Path],
-        dest: Union[str, Path],
-        fmt: ImageFormat,
-        *,
-        quality: Optional[int] = None,
-    ) -> None:
-        """
-        Convert an image to a different format.
 
-        Args:
-            src: Source image path.
-            dest: Destination path (extension may be ignored).
-            fmt: Target image format.
-            quality: Optional quality (1‑95) for lossy formats (e.g., JPEG).
+def convert_image_format(
+    input_path: Path,
+    output_path: Path,
+    target_format: str,
+    *,
+    quality: int = 85,
+) -> None:
+    """
+    Convert an image to *target_format* and write it to *output_path*.
 
-        Raises:
-            ImageProcessingError: On failure.
-        """
-        src_path = _safe_path(src)
-        dest_path = _safe_path(dest)
+    Args:
+        input_path: Path to the source image.
+        output_path: Destination path for the converted image.
+        target_format: One of ``'JPEG'``, ``'PNG'`` or ``'WEBP'`` (case‑insensitive).
+        quality: Quality setting for lossy formats (default: 85).
 
-        logger.debug("Converting %s -> %s as %s", src_path, dest_path, fmt)
+    Raises:
+        ImageProcessingError: If conversion fails or an unsupported format is
+            requested.
+    """
+    _ensure_path_is_image(input_path)
+    fmt = target_format.upper()
+    if fmt not in ALLOWED_FORMATS:
+        raise ImageProcessingError(
+            f"Unsupported target format '{target_format}'. "
+            f"Allowed: {sorted(ALLOWED_FORMATS)}"
+        )
+    try:
+        with Image.open(input_path) as img:
+            rgb_img = img.convert("RGB") if fmt == "JPEG" else img
+            rgb_img.save(output_path, format=fmt, quality=quality)
+    except (UnidentifiedImageError, OSError) as exc:
+        raise ImageProcessingError(
+            f"Failed to convert image '{input_path}' to {fmt}: {exc}"
+        ) from exc
+
+
+def apply_filter(
+    input_path: Path,
+    output_path: Path,
+    filter_name: str,
+) -> None:
+    """
+    Apply a simple filter (blur, sharpen, edge) to an image.
+
+    Args:
+        input_path: Path to the source image.
+        output_path: Destination path for the filtered image.
+        filter_name: Name of the filter – ``'blur'``, ``'sharpen'`` or ``'edge'``.
+
+    Raises:
+        ImageProcessingError: If the filter name is unknown or processing fails.
+    """
+    _ensure_path_is_image(input_path)
+    filter_func = FILTER_MAP.get(filter_name.lower())
+    if filter_func is None:
+        raise ImageProcessingError(
+            f"Unsupported filter '{filter_name}'. "
+            f"Supported: {sorted(FILTER_MAP)}"
+        )
+    try:
+        with Image.open(input_path) as img:
+            filtered = filter_func(img)
+            filtered.save(output_path)
+    except (UnidentifiedImageError, OSError) as exc:
+        raise ImageProcessingError(
+            f"Failed to apply filter '{filter_name}' on '{input_path}': {exc}"
+        ) from exc
+
+
+def process_folder(
+    input_dir: Path,
+    output_dir: Path,
+    *,
+    size: Optional[Tuple[int, int]] = None,
+    target_format: Optional[str] = None,
+    filter_name: Optional[str] = None,
+    overwrite: bool = False,
+) -> List[Path]:
+    """
+    Batch‑process every supported image in *input_dir*.
+
+    For each image the following optional steps are performed in order:
+    1. Resize (if *size* is provided)
+    2. Format conversion (if *target_format* is provided)
+    3. Filter application (if *filter_name* is provided)
+
+    The processed files are written to *output_dir* preserving the original
+    filename (with a new extension if the format changes).
+
+    Args:
+        input_dir: Directory containing source images.
+        output_dir: Directory where processed images will be saved.
+        size: Desired dimensions for resizing (width, height) or ``None``.
+        target_format: Desired output format or ``None``.
+        filter_name: Name of filter to apply or ``None``.
+        overwrite: If ``True`` existing files in *output_dir* will be overwritten.
+
+    Returns:
+        List[Path]: Paths of all successfully processed images.
+
+    Raises:
+        ImageProcessingError: If *input_dir* or *output_dir* are invalid,
+            or an unrecoverable error occurs during processing.
+    """
+    if not input_dir.is_dir():
+        raise ImageProcessingError(f"Input directory '{input_dir}' does not exist.")
+    output_dir.mkdir(parents=True, exist_ok=True)
+
+    processed: List[Path] = []
+
+    for entry in input_dir.iterdir():
+        if not entry.is_file() or entry.suffix.lower() not in ALLOWED_EXTENSIONS:
+            continue  # Skip non‑image files silently
 
         try:
-            img = self._load_image(src_path)
-            _ensure_directory(dest_path)
+            # Determine the final extension based on target format (if any)
+            final_ext = (
+                f".{target_format.lower()}"
+                if target_format
+                else entry.suffix.lower()
+            )
+            out_path = _safe_output_path(
+                output_dir, entry.name, target_format=target_format
+            )
+            if out_path.exists() and not overwrite:
+                raise ImageProcessingError(
+                    f"Output file '{out_path}' already exists and overwrite=False."
+                )
 
-            save_kwargs: dict = {"format": fmt.value}
-            if quality is not None:
-                save_kwargs["quality"] = quality
-            if self.keep_exif and "exif" in img.info:
-                save_kwargs["exif"] = img.info["exif"]
+            # Work on a temporary in‑memory image to avoid repeated disk I/O
+            with Image.open(entry) as img:
+                working = img
 
-            img.save(dest_path, **save_kwargs)
-        except Exception as exc:
+                if size:
+                    working = working.resize(size, resample=Image.LANCZOS)
+
+                if filter_name:
+                    filter_func = FILTER_MAP.get(filter_name.lower())
+                    if not filter_func:
+                        raise ImageProcessingError(
+                            f"Unsupported filter '{filter_name}'."
+                        )
+                    working = filter_func(working)
+
+                save_kwargs = {}
+                fmt = target_format.upper() if target_format else img.format
+                if fmt == "JPEG":
+                    working = working.convert("RGB")
+                    save_kwargs["quality"] = 85
+
+                working.save(out_path, format=fmt, **save_kwargs)
+
+            processed.append(out_path.resolve())
+        except ImageProcessingError:
+            # Propagate known errors with context
+            raise
+        except (UnidentifiedImageError, OSError) as exc:
             raise ImageProcessingError(
-                f"Format conversion failed for {src_path} to {fmt}"
+                f"Failed processing file '{entry}': {exc}"
             ) from exc
 
-    def apply_filter(
-        self,
-        src: Union[str, Path],
-        dest: Union[str, Path],
-        filter_type: FilterType,
-    ) -> None:
-        """
-        Apply a visual filter to an image.
+    return processed
 
-        Args:
-            src: Source image path.
-            dest: Destination path.
-            filter_type: Type of filter to apply.
 
-        Raises:
-            ImageProcessingError: On I/O or processing failure.
-        """
-        src_path = _safe_path(src)
-        dest_path = _safe_path(dest)
-
-        logger.debug("Applying filter %s on %s -> %s", filter_type, src_path, dest_path)
-
-        try:
-            img = self._load_image(src_path)
-
-            filter_obj = _FILTER_MAP[filter_type]
-            filtered = img.filter(filter_obj)
-
-            _ensure_directory(dest_path)
-            save_kwargs = {}
-            if self.keep_exif and "exif" in img.info:
-                save_kwargs["exif"] = img.info["exif"]
-
-            filtered.save(dest_path, **save_kwargs)
-        except Exception as exc:
-            raise ImageProcessingError(
-                f"Applying filter {filter_type} failed for {src_path}"
-            ) from exc
-
-    # ------------------------------------------------------------------- #
-    # Batch processing
-    # ------------------------------------------------------------------- #
-
-    def batch_process(
-        self,
-        sources: Iterable[Union[str, Path]],
-        destination_dir: Union[str, Path],
-        *,
-        resize_to: Optional[Tuple[int, int]] = None,
-        convert_to: Optional[ImageFormat] = None,
-        filter_type: Optional[FilterType] = None,
-        quality: Optional[int] = None,
-        overwrite: bool = False,
-    ) -> List[Path]:
-        """
-        Process multiple images sequentially.
-
-        The operations are applied in the order: resize → filter → format conversion.
-
-        Args:
-            sources: Iterable of image paths to process.
-            destination_dir: Directory where processed images will be saved.
-            resize_to: Optional (width, height) tuple
+__all__ = [
+    "ImageProcessingError",
+    "resize_image",
+    "convert_image_format",
+    "apply_filter",
+    "process_folder",
+]

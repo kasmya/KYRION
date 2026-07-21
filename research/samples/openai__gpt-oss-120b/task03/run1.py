@@ -1,250 +1,264 @@
 """
-Real‑time chat server using Flask‑SocketIO.
+chat_server.py
 
-Features
---------
-- User connection with a chosen nickname.
+A simple real-time chat server using WebSockets.
+
+Features:
+- User registration with unique usernames.
 - Broadcast messages to all connected users.
-- Private messages between users.
-- Graceful handling of disconnects.
-- Basic security measures (input validation, escaping, CORS, secret key).
+- Private messages between two users.
+- Graceful handling of disconnects and errors.
 
-Run
----
-$ pip install Flask Flask‑SocketIO eventlet
-$ python chat_server.py
+Security considerations:
+- Username validation (alphanumeric, length limits).
+- Message size limit (max 2048 bytes).
+- JSON schema validation.
+- Exception handling for malformed data and connection issues.
+
+Dependencies:
+- websockets (https://pypi.org/project/websockets/)
+- Python 3.9+
+
+Run the server:
+    python -m chat_server
 """
 
-from __future__ import annotations
-
-import html
+import asyncio
+import json
 import logging
+import re
 from typing import Dict, Set
 
-from flask import Flask, request, jsonify
-from flask_socketio import (
-    SocketIO,
-    emit,
-    join_room,
-    leave_room,
-    disconnect,
-    ConnectionRefusedError,
+import websockets
+from websockets import WebSocketServerProtocol, ConnectionClosedError
+
+# Configure logging
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s %(levelname)s %(message)s",
 )
 
-# --------------------------------------------------------------------------- #
-# Configuration
-# --------------------------------------------------------------------------- #
+# Global state (protected by asyncio locks)
+_CONNECTED_USERS: Dict[str, WebSocketServerProtocol] = {}
+_USERS_LOCK = asyncio.Lock()
 
-app = Flask(__name__)
-# In production use a strong, random secret key and configure HTTPS.
-app.config["SECRET_KEY"] = "change_this_secret_key_in_production"
-# Restrict origins for security – adjust as needed.
-app.config["CORS_ALLOWED_ORIGINS"] = ["http://localhost:5000"]
-
-# Use eventlet for asynchronous networking (or gevent, etc.).
-socketio = SocketIO(app, cors_allowed_origins=app.config["CORS_ALLOWED_ORIGINS"], async_mode="eventlet")
-
-# --------------------------------------------------------------------------- #
-# In‑memory user store (sid ↔ username)
-# --------------------------------------------------------------------------- #
-
-# Mapping of Socket.IO session id -> username
-sid_to_user: Dict[str, str] = {}
-# Reverse mapping of username -> sid (unique usernames enforced)
-user_to_sid: Dict[str, str] = {}
-# Active usernames (helps for validation)
-active_usernames: Set[str] = set()
-
-# --------------------------------------------------------------------------- #
-# Helper utilities
-# --------------------------------------------------------------------------- #
+# Constants
+MAX_MESSAGE_SIZE = 2_048  # bytes
+USERNAME_REGEX = re.compile(r"^[A-Za-z0-9_]{3,20}$")
 
 
-def _sanitize_message(message: str) -> str:
-    """Escape HTML to prevent injection attacks."""
-    return html.escape(message)
+async def register_user(username: str, ws: WebSocketServerProtocol) -> None:
+    """
+    Register a new user.
+
+    Args:
+        username: Desired username (must be validated before calling).
+        ws: WebSocket connection associated with the user.
+
+    Raises:
+        ValueError: If the username is already taken.
+    """
+    async with _USERS_LOCK:
+        if username in _CONNECTED_USERS:
+            raise ValueError(f"Username '{username}' is already in use.")
+        _CONNECTED_USERS[username] = ws
+        logging.info("User registered: %s", username)
+
+
+async def unregister_user(username: str) -> None:
+    """
+    Remove a user from the connected users list and broadcast the departure.
+
+    Args:
+        username: The username to remove.
+    """
+    async with _USERS_LOCK:
+        ws = _CONNECTED_USERS.pop(username, None)
+        if ws:
+            logging.info("User unregistered: %s", username)
+            await broadcast_system_message(f"{username} has left the chat.")
+
+
+async def broadcast_system_message(message: str) -> None:
+    """
+    Send a system message to all connected users.
+
+    Args:
+        message: Text to broadcast.
+    """
+    await _broadcast({"type": "system", "message": message})
+
+
+async def broadcast_user_message(sender: str, message: str) -> None:
+    """
+    Broadcast a user message to all connected users except the sender.
+
+    Args:
+        sender: Username of the message origin.
+        message: Text to broadcast.
+    """
+    await _broadcast(
+        {"type": "broadcast", "from": sender, "message": message},
+        exclude={sender},
+    )
+
+
+async def send_private_message(sender: str, recipient: str, message: str) -> None:
+    """
+    Send a private message from one user to another.
+
+    Args:
+        sender: Username of the message origin.
+        recipient: Target username.
+        message: Text to send.
+
+    Raises:
+        KeyError: If the recipient is not connected.
+    """
+    async with _USERS_LOCK:
+        target_ws = _CONNECTED_USERS.get(recipient)
+        if not target_ws:
+            raise KeyError(f"Recipient '{recipient}' not connected.")
+        payload = {
+            "type": "private",
+            "from": sender,
+            "to": recipient,
+            "message": message,
+        }
+        await target_ws.send(json.dumps(payload))
+
+
+async def _broadcast(payload: dict, exclude: Set[str] = None) -> None:
+    """
+    Internal helper to broadcast a JSON payload to all users.
+
+    Args:
+        payload: JSON-serializable dict to send.
+        exclude: Optional set of usernames to skip.
+    """
+    if exclude is None:
+        exclude = set()
+    message = json.dumps(payload)
+    async with _USERS_LOCK:
+        coros = [
+            ws.send(message)
+            for user, ws in _CONNECTED_USERS.items()
+            if user not in exclude
+        ]
+    if coros:
+        await asyncio.gather(*coros, return_exceptions=True)
 
 
 def _validate_username(username: str) -> None:
     """
-    Validate a username. Raises ``ValueError`` if invalid.
+    Validate a username against security constraints.
 
-    Rules:
-        * 3‑30 printable characters
-        * No whitespace at the ends
-        * Must be unique among connected users
+    Args:
+        username: The username string to validate.
+
+    Raises:
+        ValueError: If the username is invalid.
     """
-    if not (3 <= len(username) <= 30):
-        raise ValueError("Username must be between 3 and 30 characters.")
-    if username.strip() != username:
-        raise ValueError("Username cannot start or end with whitespace.")
-    if any(c.isspace() for c in username):
-        raise ValueError("Username cannot contain whitespace characters.")
-    if username in active_usernames:
-        raise ValueError("Username already taken.")
-
-
-def _get_sid_by_username(username: str) -> str | None:
-    """Return the sid for a given username, or ``None`` if not connected."""
-    return user_to_sid.get(username)
-
-
-# --------------------------------------------------------------------------- #
-# SocketIO event handlers
-# --------------------------------------------------------------------------- #
-
-
-@socketio.on("connect")
-def handle_connect() -> None:
-    """
-    New client has established a WebSocket connection.
-
-    The client must immediately emit a ``join`` event with a nickname.
-    If the client does not send a nickname within a short interval,
-    the server will disconnect it (handled client‑side).
-    """
-    logging.info(f"Client connected: SID={request.sid}")
-
-
-@socketio.on("join")
-def handle_join(data: dict) -> None:
-    """
-    Register a new user.
-
-    Expected ``data`` format:
-        {"username": "<desired nickname>"}
-    """
-    try:
-        username_raw = data.get("username", "")
-        username = str(username_raw).strip()
-        _validate_username(username)
-
-        sid = request.sid
-        sid_to_user[sid] = username
-        user_to_sid[username] = sid
-        active_usernames.add(username)
-
-        # Put the user in a personal room (for private messaging)
-        join_room(sid)
-
-        emit("join_success", {"username": username}, room=sid)
-        emit(
-            "user_joined",
-            {"username": username, "online_users": list(active_usernames)},
-            broadcast=True,
-            include_self=False,
+    if not USERNAME_REGEX.fullmatch(username):
+        raise ValueError(
+            "Username must be 3-20 characters long, alphanumeric or underscores."
         )
-        logging.info(f"User '{username}' joined, SID={sid}")
-
-    except (ValueError, KeyError) as exc:
-        logging.warning(f"Join failed: {exc}")
-        emit("join_error", {"error": str(exc)})
-        # Disconnect the offending client to keep state consistent.
-        disconnect()
 
 
-@socketio.on("message")
-def handle_message(data: dict) -> None:
+def _validate_message_content(content: str) -> None:
     """
-    Broadcast a message to all connected users.
+    Validate message content size.
 
-    Expected ``data`` format:
-        {"message": "<text>"}
+    Args:
+        content: The message string.
+
+    Raises:
+        ValueError: If the message exceeds the allowed size.
     """
+    if len(content.encode("utf-8")) > MAX_MESSAGE_SIZE:
+        raise ValueError("Message exceeds maximum allowed size.")
+
+
+async def handler(ws: WebSocketServerProtocol, path: str) -> None:
+    """
+    Main connection handler for each client.
+
+    Protocol:
+        1. Client sends a registration message:
+           {"type": "register", "username": "desired_name"}
+        2. Server validates and registers the user.
+        3. Afterwards, client may send:
+           - Broadcast: {"type": "broadcast", "message": "..."}
+           - Private:   {"type": "private", "to": "username", "message": "..."}
+        4. Server responds with success or error messages.
+
+    Args:
+        ws: The client WebSocket connection.
+        path: URL path (unused).
+    """
+    username = None
     try:
-        sid = request.sid
-        username = sid_to_user[sid]  # raises KeyError if not registered
-        raw_message = data.get("message", "")
-        message = _sanitize_message(str(raw_message))
+        # Expect registration as first message
+        raw = await asyncio.wait_for(ws.recv(), timeout=30)
+        data = json.loads(raw)
+        if data.get("type") != "register" or "username" not in data:
+            await ws.send(
+                json.dumps(
+                    {"type": "error", "message": "First message must be registration."}
+                )
+            )
+            return
 
-        if not message:
-            raise ValueError("Empty messages are not allowed.")
+        proposed_name = str(data["username"]).strip()
+        _validate_username(proposed_name)
+        await register_user(proposed_name, ws)
+        username = proposed_name
+        await ws.send(json.dumps({"type": "info", "message": f"Welcome, {username}!"}))
+        await broadcast_system_message(f"{username} has joined the chat.")
 
-        emit(
-            "new_message",
-            {"username": username, "message": message},
-            broadcast=True,
-        )
-        logging.debug(f"Broadcast from {username}: {message}")
+        # Main message loop
+        async for raw_msg in ws:
+            try:
+                if len(raw_msg.encode("utf-8")) > MAX_MESSAGE_SIZE:
+                    raise ValueError("Incoming message too large.")
+                msg = json.loads(raw_msg)
+                msg_type = msg.get("type")
+                if msg_type == "broadcast":
+                    content = str(msg.get("message", "")).strip()
+                    _validate_message_content(content)
+                    await broadcast_user_message(username, content)
+                elif msg_type == "private":
+                    recipient = str(msg.get("to", "")).strip()
+                    content = str(msg.get("message", "")).strip()
+                    _validate_message_content(content)
+                    await send_private_message(username, recipient, content)
+                else:
+                    raise ValueError("Unsupported message type.")
+            except (json.JSONDecodeError, ValueError, KeyError) as exc:
+                error_payload = {"type": "error", "message": str(exc)}
+                await ws.send(json.dumps(error_payload))
+    except (ConnectionClosedError, asyncio.TimeoutError) as exc:
+        logging.info("Connection closed for %s: %s", username or "unknown", exc)
+    finally:
+        if username:
+            await unregister_user(username)
 
-    except (KeyError, ValueError) as exc:
-        logging.error(f"Message handling error: {exc}")
-        emit("error", {"error": str(exc)})
 
-
-@socketio.on("private_message")
-def handle_private_message(data: dict) -> None:
+async def main(host: str = "localhost", port: int = 8765) -> None:
     """
-    Send a private message to a specific user.
+    Start the WebSocket chat server.
 
-    Expected ``data`` format:
-        {"to": "<target username>", "message": "<text>"}
+    Args:
+        host: Host interface to bind.
+        port: TCP port to listen on.
     """
-    try:
-        sid = request.sid
-        sender = sid_to_user[sid]  # raises KeyError if not registered
-
-        target_username = str(data.get("to", "")).strip()
-        raw_message = data.get("message", "")
-        message = _sanitize_message(str(raw_message))
-
-        if not target_username or not message:
-            raise ValueError("Both recipient and message are required.")
-
-        target_sid = _get_sid_by_username(target_username)
-        if not target_sid:
-            raise ValueError(f"User '{target_username}' not online.")
-
-        payload = {"from": sender, "message": message}
-        emit("private_message", payload, room=target_sid)
-        emit("private_message_sent", {"to": target_username, "message": message}, room=sid)
-
-        logging.info(f"Private message from {sender} to {target_username}")
-
-    except (KeyError, ValueError) as exc:
-        logging.error(f"Private message error: {exc}")
-        emit("error", {"error": str(exc)})
-
-
-@socketio.on("disconnect")
-def handle_disconnect() -> None:
-    """
-    Clean up user state when a client disconnects.
-    """
-    sid = request.sid
-    username = sid_to_user.pop(sid, None)
-    if username:
-        user_to_sid.pop(username, None)
-        active_usernames.discard(username)
-        leave_room(sid)
-        emit(
-            "user_left",
-            {"username": username, "online_users": list(active_usernames)},
-            broadcast=True,
-        )
-        logging.info(f"User '{username}' disconnected, SID={sid}")
-    else:
-        logging.info(f"Unregistered SID {sid} disconnected")
-
-
-# --------------------------------------------------------------------------- #
-# HTTP endpoints (optional health check)
-# --------------------------------------------------------------------------- #
-
-
-@app.route("/health", methods=["GET"])
-def health_check() -> tuple[dict[str, str], int]:
-    """Simple health‑check endpoint."""
-    return jsonify(status="ok"), 200
-
-
-# --------------------------------------------------------------------------- #
-# Application entry point
-# --------------------------------------------------------------------------- #
+    async with websockets.serve(handler, host, port, max_size=MAX_MESSAGE_SIZE):
+        logging.info("Chat server started on ws://%s:%d", host, port)
+        await asyncio.Future()  # run forever
 
 
 if __name__ == "__main__":
-    # In production configure proper logging, TLS termination, and a robust WSGI server.
-    logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
-    # ``debug=False`` disables the Flask debugger and the reloader.
-    socketio.run(app, host="0.0.0.0", port=5000, debug=False)
+    try:
+        asyncio.run(main())
+    except KeyboardInterrupt:
+        logging.info("Chat server stopped by user.")

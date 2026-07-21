@@ -1,191 +1,305 @@
-"""Real‑time chat server using Flask‑SocketIO.
+"""
+chat_server.py
+--------------
 
-Features:
-- User connection with simple token‑based identification.
-- Broadcast messages to all connected users.
-- Private messages between specific users.
-- Clean disconnection handling.
-- Basic security: input sanitisation, message length limits,
-  CORS restrictions and secret key.
+A simple real‑time chat server built on top of the ``websockets`` library.
+It supports:
 
-Run with:
-    pip install flask flask-socketio eventlet
-    python chat_server.py
+* User registration (unique usernames)
+* Broadcast messaging to all connected users
+* Private messaging between two users
+* Graceful handling of client disconnects
+
+The server validates inbound messages, enforces a maximum payload size,
+and isolates client interactions to prevent crashes from malformed data.
+
+Only the Python standard library and the widely‑used ``websockets`` package
+are required.
 """
 
 from __future__ import annotations
 
-import html
-from typing import Dict, Any
+import asyncio
+import json
+import logging
+from dataclasses import dataclass, field
+from typing import Dict, Set
 
-from flask import Flask, request, abort
-from flask_socketio import SocketIO, emit, join_room, leave_room, disconnect
-
-# --------------------------------------------------------------------------- #
-# Flask & SocketIO configuration
-# --------------------------------------------------------------------------- #
-app = Flask(__name__)
-# NOTE: Replace with a strong random value in production
-app.config["SECRET_KEY"] = "change_this_to_a_strong_random_secret"
-# Restrict origins to known front‑ends; adjust as needed
-socketio = SocketIO(app, cors_allowed_origins=["http://localhost:3000"])
+import websockets
+from websockets import WebSocketServerProtocol
 
 # --------------------------------------------------------------------------- #
-# In‑memory state
+# Configuration
 # --------------------------------------------------------------------------- #
-# Mapping from Socket.IO session id (sid) to username
-users: Dict[str, str] = {}
-# Reverse lookup: username -> sid (for private messaging)
-rooms: Dict[str, str] = {}
 
-# Application constants
-MAX_MESSAGE_LENGTH = 500  # Prevent excessively large payloads
+MAX_MESSAGE_SIZE = 4096  # bytes
+ALLOWED_ORIGINS: Set[str] = {"http://localhost", "https://mychat.example.com"}
+LOG_FORMAT = "%(asctime)s %(levelname)s %(message)s"
+logging.basicConfig(level=logging.INFO, format=LOG_FORMAT)
+
+# --------------------------------------------------------------------------- #
+# Helper data structures
+# --------------------------------------------------------------------------- #
 
 
-def sanitize(text: str) -> str:
-    """HTML‑escape a string and trim whitespace.
+@dataclass
+class ConnectedClient:
+    """Container for a connected client."""
+
+    username: str
+    websocket: WebSocketServerProtocol
+    # Additional fields (e.g., authentication token) could be added here.
+
+
+# --------------------------------------------------------------------------- #
+# Core server implementation
+# --------------------------------------------------------------------------- #
+
+
+class ChatServer:
+    """
+    Manages client connections and message routing.
+
+    The server keeps a mapping of usernames to :class:`ConnectedClient` objects.
+    All public methods raise :class:`ValueError` on invalid usage.
+    """
+
+    def __init__(self) -> None:
+        self._clients: Dict[str, ConnectedClient] = {}
+        self._lock = asyncio.Lock()
+
+    # ------------------------------------------------------------------- #
+    # Connection handling
+    # ------------------------------------------------------------------- #
+
+    async def register(self, client: ConnectedClient) -> None:
+        """
+        Register a new client.
+
+        Args:
+            client: The client to register.
+
+        Raises:
+            ValueError: If the username is already taken.
+        """
+        async with self._lock:
+            if client.username in self._clients:
+                raise ValueError(f"Username '{client.username}' already in use.")
+            self._clients[client.username] = client
+            logging.info("User registered: %s", client.username)
+
+    async def unregister(self, username: str) -> None:
+        """
+        Unregister a client by username.
+
+        Args:
+            username: The username to remove.
+
+        Raises:
+            ValueError: If the username is not known.
+        """
+        async with self._lock:
+            if username not in self._clients:
+                raise ValueError(f"Username '{username}' not found.")
+            del self._clients[username]
+            logging.info("User disconnected: %s", username)
+
+    # ------------------------------------------------------------------- #
+    # Messaging
+    # ------------------------------------------------------------------- #
+
+    async def broadcast(self, sender: str, message: str) -> None:
+        """
+        Send a message to all connected clients except the sender.
+
+        Args:
+            sender: Username of the message origin.
+            message: Text to broadcast.
+
+        Raises:
+            RuntimeError: If sending to a client fails.
+        """
+        payload = json.dumps(
+            {"type": "broadcast", "from": sender, "message": message}
+        )
+        async with self._lock:
+            coros = [
+                client.websocket.send(payload)
+                for uname, client in self._clients.items()
+                if uname != sender
+            ]
+        await self._safe_gather(coros, context="broadcast")
+
+    async def private_message(self, sender: str, recipient: str, message: str) -> None:
+        """
+        Send a private message from ``sender`` to ``recipient``.
+
+        Args:
+            sender: Username of the sender.
+            recipient: Username of the receiver.
+            message: Text to send.
+
+        Raises:
+            ValueError: If the recipient does not exist.
+            RuntimeError: If sending fails.
+        """
+        async with self._lock:
+            if recipient not in self._clients:
+                raise ValueError(f"Recipient '{recipient}' not connected.")
+            target_ws = self._clients[recipient].websocket
+
+        payload = json.dumps(
+            {"type": "private", "from": sender, "to": recipient, "message": message}
+        )
+        await self._safe_gather([target_ws.send(payload)], context="private_message")
+
+    # ------------------------------------------------------------------- #
+    # Internal utilities
+    # ------------------------------------------------------------------- #
+
+    async def _safe_gather(self, coroutines: list[asyncio.Future], *, context: str) -> None:
+        """
+        Await a list of coroutines, logging any failures without propagating
+        them to the caller.
+
+        Args:
+            coroutines: Awaitable objects to run.
+            context: Human‑readable description used for logging.
+        """
+        results = await asyncio.gather(*coroutines, return_exceptions=True)
+        for idx, result in enumerate(results):
+            if isinstance(result, Exception):
+                logging.error(
+                    "Error during %s (task %s): %s", context, idx, result, exc_info=True
+                )
+
+    async def _handle_message(self, client: ConnectedClient, raw_msg: str) -> None:
+        """
+        Parse and route a raw JSON message from a client.
+
+        Args:
+            client: The sender client.
+            raw_msg: Raw JSON string.
+
+        Raises:
+            ValueError: If the payload is malformed or violates protocol.
+        """
+        if len(raw_msg.encode("utf-8")) > MAX_MESSAGE_SIZE:
+            raise ValueError("Message exceeds maximum allowed size.")
+
+        try:
+            data = json.loads(raw_msg)
+        except json.JSONDecodeError as exc:
+            raise ValueError("Invalid JSON payload.") from exc
+
+        msg_type = data.get("type")
+        if msg_type == "broadcast":
+            message = data.get("message", "")
+            await self.broadcast(client.username, message)
+        elif msg_type == "private":
+            recipient = data.get("to")
+            message = data.get("message", "")
+            if not recipient:
+                raise ValueError("Private messages require a 'to' field.")
+            await self.private_message(client.username, recipient, message)
+        else:
+            raise ValueError(f"Unsupported message type: {msg_type}")
+
+    # ------------------------------------------------------------------- #
+    # WebSocket entry point
+    # ------------------------------------------------------------------- #
+
+    async def handler(self, websocket: WebSocketServerProtocol, path: str) -> None:
+        """
+        Main entry point for each WebSocket connection.
+
+        Protocol:
+            1. Client sends a JSON registration message:
+               ``{"type": "register", "username": "<desired_name>"}``
+            2. Server acknowledges or closes the connection on error.
+            3. Subsequent messages follow the schema described in
+               :meth:`_handle_message`.
+
+        Args:
+            websocket: The client connection.
+            path: The request path (unused).
+
+        The coroutine runs until the client disconnects.
+        """
+        try:
+            # Enforce origin check for basic CSRF mitigation
+            origin = websocket.request_headers.get("Origin", "")
+            if origin not in ALLOWED_ORIGINS:
+                await websocket.close(code=4001, reason="Invalid origin.")
+                logging.warning("Connection rejected due to origin: %s", origin)
+                return
+
+            # Await registration
+            raw = await asyncio.wait_for(websocket.recv(), timeout=10)
+            reg_data = json.loads(raw)
+            if reg_data.get("type") != "register" or "username" not in reg_data:
+                raise ValueError("First message must be a registration with a username.")
+            username = str(reg_data["username"]).strip()
+            if not username:
+                raise ValueError("Username cannot be empty.")
+
+            client = ConnectedClient(username=username, websocket=websocket)
+            await self.register(client)
+
+            # Notify the new client of successful registration
+            await websocket.send(json.dumps({"type": "welcome", "username": username}))
+
+            # Main message loop
+            async for raw_msg in websocket:
+                try:
+                    await self._handle_message(client, raw_msg)
+                except ValueError as exc:
+                    await websocket.send(json.dumps({"type": "error", "detail": str(exc)}))
+        except (asyncio.TimeoutError, websockets.exceptions.ConnectionClosedError) as exc:
+            logging.info("Connection closed abruptly: %s", exc)
+        except Exception as exc:  # Catch‑all for unexpected errors
+            logging.error("Unexpected error: %s", exc, exc_info=True)
+            await websocket.close(code=1011, reason="Internal server error.")
+        finally:
+            # Cleanup irrespective of how the loop exited
+            if "client" in locals():
+                try:
+                    await self.unregister(client.username)
+                except Exception as exc:
+                    logging.error(
+                        "Error during unregister of %s: %s", client.username, exc, exc_info=True
+                    )
+                # Inform remaining users about the disconnect
+                await self.broadcast("system", f"{client.username} has left the chat.")
+
+
+# --------------------------------------------------------------------------- #
+# Server bootstrap
+# --------------------------------------------------------------------------- #
+
+
+async def main(host: str = "localhost", port: int = 8765) -> None:
+    """
+    Start the WebSocket chat server.
 
     Args:
-        text: Raw message content.
-
-    Returns:
-        A safe, escaped version of *text*.
+        host: Interface to bind to.
+        port: TCP port to listen on.
     """
-    return html.escape(text.strip())
+    server = ChatServer()
+    async with websockets.serve(
+        server.handler,
+        host,
+        port,
+        max_size=MAX_MESSAGE_SIZE,
+        origins=ALLOWED_ORIGINS,
+    ):
+        logging.info("Chat server listening on ws://%s:%s", host, port)
+        await asyncio.Future()  # Run forever
 
 
-# --------------------------------------------------------------------------- #
-# Event handlers
-# --------------------------------------------------------------------------- #
-@socketio.event
-def connect(auth: Dict[str, Any] | None = None):
-    """Authenticate a new client.
-
-    The client must send an ``auth`` dict containing a ``token`` field.
-    For demo purposes the token itself is treated as the username.
-    """
-    if not auth or "token" not in auth:
-        # Reject the connection if no token is supplied
-        return False
-
-    token = auth["token"]
-    username = str(token).strip()
-    if not username:
-        return False
-
-    sid = request.sid
-
-    # Ensure username uniqueness
-    if username in rooms:
-        emit("error", {"msg": "Username already in use."}, to=sid)
-        disconnect()
-        return
-
-    users[sid] = username
-    rooms[username] = sid
-    join_room("global")
-
-    # Notify the new client
-    emit("connected", {"msg": f"Welcome {username}!"}, to=sid)
-
-    # Broadcast presence to others
-    emit(
-        "user_joined",
-        {"username": username},
-        broadcast=True,
-        include_self=False,
-    )
-
-
-@socketio.event
-def disconnect():
-    """Cleanup after a client disconnects."""
-    sid = request.sid
-    username = users.pop(sid, None)
-
-    if username:
-        rooms.pop(username, None)
-        leave_room("global")
-        emit("user_left", {"username": username}, broadcast=True)
-
-
-@socketio.on("broadcast")
-def handle_broadcast(data: Dict[str, Any]):
-    """Receive a message from a client and broadcast it.
-
-    Expected payload:
-        {"msg": "<message text>"}
-    """
-    sid = request.sid
-    username = users.get(sid)
-
-    if not username:
-        emit("error", {"msg": "Unauthenticated."}, to=sid)
-        return
-
-    raw_msg = data.get("msg", "")
-    if not isinstance(raw_msg, str):
-        emit("error", {"msg": "Invalid message format."}, to=sid)
-        return
-
-    if len(raw_msg) > MAX_MESSAGE_LENGTH:
-        emit("error", {"msg": "Message too long."}, to=sid)
-        return
-
-    safe_msg = sanitize(raw_msg)
-    payload = {"username": username, "msg": safe_msg}
-    emit("broadcast", payload, broadcast=True)
-
-
-@socketio.on("private_message")
-def handle_private_message(data: Dict[str, Any]):
-    """Send a private message to a specific user.
-
-    Expected payload:
-        {"to": "<recipient username>", "msg": "<message text>"}
-    """
-    sid = request.sid
-    sender = users.get(sid)
-
-    if not sender:
-        emit("error", {"msg": "Unauthenticated."}, to=sid)
-        return
-
-    target = data.get("to")
-    raw_msg = data.get("msg", "")
-
-    if not isinstance(target, str) or not isinstance(raw_msg, str):
-        emit("error", {"msg": "Invalid payload."}, to=sid)
-        return
-
-    if len(raw_msg) > MAX_MESSAGE_LENGTH:
-        emit("error", {"msg": "Message too long."}, to=sid)
-        return
-
-    safe_msg = sanitize(raw_msg)
-    target_sid = rooms.get(target)
-
-    if not target_sid:
-        emit("error", {"msg": f"User {target} not connected."}, to=sid)
-        return
-
-    payload = {"from": sender, "msg": safe_msg}
-    emit("private_message", payload, to=target_sid)
-
-    # Acknowledge the sender (optional)
-    emit(
-        "private_message_sent",
-        {"to": target, "msg": safe_msg},
-        to=sid,
-    )
-
-
-# --------------------------------------------------------------------------- #
-# Application entry point
-# --------------------------------------------------------------------------- #
 if __name__ == "__main__":
-    # Use eventlet for scalable WebSocket handling
-    import eventlet
-
-    eventlet.monkey_patch()
-    socketio.run(app, host="0.0.0.0", port=5000)
+    try:
+        asyncio.run(main())
+    except KeyboardInterrupt:
+        logging.info("Chat server stopped by user.")

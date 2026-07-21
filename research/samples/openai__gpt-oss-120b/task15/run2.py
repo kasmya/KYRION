@@ -1,177 +1,233 @@
 """
-data_validation_service.py
+json_validator.py
 
-A lightweight JSON data validation service built on top of the standard library
-and the well‑known ``jsonschema`` package.
+A lightweight JSON data‑validation service.
 
 Features
 --------
-* Schema definition in JSON (or Python dict)
-* Required‑field validation
-* Type checking
-* Regex pattern matching for strings
-* Detailed error reporting with JSON‑pointer paths
-* Type hints, docstrings, and robust error handling
-* Security‑focused defaults (no external references, safe schema loading)
+- Load a JSON schema from a file or a Python dictionary.
+- Validate JSON data against the schema.
+- Perform required‑field checks, type checking, and pattern matching.
+- Return a list of human‑readable error messages.
+- Explicit error handling and clear type hints.
 
-Usage
------
->>> from data_validation_service import JsonValidator, ValidationErrorDetail
->>> schema = {
-...     "type": "object",
-...     "properties": {
-...         "name": {"type": "string", "pattern": "^[A-Za-z ]+$"},
-...         "age": {"type": "integer", "minimum": 0},
-...         "email": {"type": "string", "format": "email"},
-...     },
-...     "required": ["name", "age"],
-... }
->>> validator = JsonValidator(schema)
->>> data = {"name": "John Doe", "age": 30, "email": "john@example.com"}
->>> validator.validate(data)  # returns True
->>> bad_data = {"name": "John123", "age": -5}
->>> is_valid, errors = validator.validate(bad_data)
->>> is_valid
-False
->>> errors[0].message
-"'John123' does not match '^[A-Za-z ]+$'"
+The implementation relies only on the Python standard library and the
+widely‑used ``jsonschema`` package (https://pypi.org/project/jsonschema/).
 """
 
 from __future__ import annotations
 
 import json
+import pathlib
 import re
 from dataclasses import dataclass
-from pathlib import Path
-from typing import Any, Dict, List, Tuple, Union
+from typing import Any, Dict, List, Mapping, Sequence, Union
 
 import jsonschema
-from jsonschema import Draft7Validator, ValidationError as JsonSchemaValidationError
+from jsonschema import Draft7Validator, ValidationError as JsonSchemaError
 
 # --------------------------------------------------------------------------- #
 # Data structures
 # --------------------------------------------------------------------------- #
 
 
-@dataclass(frozen=True)
-class ValidationErrorDetail:
-    """A single validation error with a human readable message and a JSON pointer."""
+@dataclass(frozen=True, slots=True)
+class ValidationError:
+    """Container for a single validation error.
 
+    Attributes
+    ----------
+    field_path: str
+        JSON pointer (e.g. ``/address/street``) indicating where the error
+        occurred.
     message: str
-    """Human readable description of the validation problem."""
-
-    path: str
-    """JSON pointer string indicating the location of the error in the instance."""
-
-    validator: str
-    """Name of the validator that raised the error (e.g. 'type', 'required')."""
-
-    validator_value: Any
-    """The schema value that caused the validation error."""
-
-
-# --------------------------------------------------------------------------- #
-# Core validator
-# --------------------------------------------------------------------------- #
-
-
-class JsonValidator:
+        Human‑readable description of the problem.
     """
-    Validate JSON data against a JSON schema.
 
-    The validator uses ``jsonschema.Draft7Validator`` under the hood and
-    provides a simple ``validate`` method that returns a boolean together
-    with a list of :class:`ValidationErrorDetail` objects.
+    field_path: str
+    message: str
+
+
+# --------------------------------------------------------------------------- #
+# Helper functions
+# --------------------------------------------------------------------------- #
+
+
+def _load_json_file(file_path: Union[str, pathlib.Path]) -> Mapping[str, Any]:
+    """Read a JSON file and return its content.
 
     Parameters
     ----------
-    schema : Union[Dict[str, Any], str, Path]
-        The JSON schema dictionary, a JSON string, or a path to a JSON file.
-        External ``$ref`` references are disabled for security.
+    file_path:
+        Path to the JSON file.
+
+    Returns
+    -------
+    Mapping[str, Any]
+        Parsed JSON object.
+
+    Raises
+    ------
+    FileNotFoundError
+        If the file does not exist.
+    json.JSONDecodeError
+        If the file does not contain valid JSON.
     """
+    path = pathlib.Path(file_path).expanduser().resolve(strict=True)
+    # Security: open the file in read‑only text mode with explicit encoding.
+    with path.open("r", encoding="utf-8") as f:
+        return json.load(f)
 
-    def __init__(self, schema: Union[Dict[str, Any], str, Path]) -> None:
-        self._schema = self._load_schema(schema)
-        self._validator = Draft7Validator(self._schema, format_checker=jsonschema.FormatChecker())
 
-    @staticmethod
-    def _load_schema(schema_source: Union[Dict[str, Any], str, Path]) -> Dict[str, Any]:
-        """Load a JSON schema from a dict, a JSON string, or a file path."""
-        if isinstance(schema_source, dict):
-            return schema_source
+def _json_pointer_to_path(pointer: str) -> str:
+    """Convert a JSON pointer (as used by ``jsonschema``) to a dotted path.
 
-        if isinstance(schema_source, (str, Path)):
-            # Resolve path safely: only allow local file system access.
-            try:
-                path = Path(schema_source).expanduser().resolve(strict=True)
-                with path.open("r", encoding="utf-8") as f:
-                    data = json.load(f)
-                if not isinstance(data, dict):
-                    raise ValueError("Loaded schema must be a JSON object.")
-                return data
-            except FileNotFoundError as e:
-                raise FileNotFoundError(f"Schema file not found: {schema_source}") from e
-            except json.JSONDecodeError as e:
-                raise ValueError(f"Invalid JSON in schema file: {schema_source}") from e
+    Example
+    -------
+    >>> _json_pointer_to_path("/address/street")
+    'address.street'
+    """
+    parts = pointer.lstrip("/").split("/")
+    # Unescape according to RFC 6901
+    parts = [p.replace("~1", "/").replace("~0", "~") for p in parts]
+    return ".".join(parts)
 
-        raise TypeError("Schema must be a dict, JSON string, or pathlib.Path.")
 
-    @staticmethod
-    def _format_error(err: JsonSchemaValidationError) -> ValidationErrorDetail:
-        """Convert a jsonschema.ValidationError into a ValidationErrorDetail."""
-        # Build a JSON pointer from the error path.
-        pointer = "/" + "/".join(str(p) for p in err.absolute_path)
-        return ValidationErrorDetail(
-            message=err.message,
-            path=pointer,
-            validator=err.validator,
-            validator_value=err.validator_value,
-        )
+def _collect_errors(validator: Draft7Validator, data: Mapping[str, Any]) -> List[ValidationError]:
+    """Run the validator and collect errors in a friendly format.
 
-    def validate(self, data: Union[Dict[str, Any], str, bytes]) -> Tuple[bool, List[ValidationErrorDetail]]:
-        """
-        Validate *data* against the stored schema.
+    Parameters
+    ----------
+    validator:
+        An instance of :class:`jsonschema.Draft7Validator`.
+    data:
+        The JSON document to validate.
 
-        Parameters
-        ----------
-        data : Union[Dict[str, Any], str, bytes]
-            JSON data to validate, either already parsed as a dict or a JSON string/bytes.
+    Returns
+    -------
+    List[ValidationError]
+        All validation errors found; empty list if the document is valid.
+    """
+    errors: List[ValidationError] = []
+    for err in sorted(validator.iter_errors(data), key=lambda e: e.path):
+        field_path = _json_pointer_to_path(err.absolute_path or "")
+        # Provide a concise message; include the failing value for context.
+        message = f"{err.message}"
+        if err.instance is not None:
+            # Avoid leaking huge structures.
+            instance_repr = json.dumps(err.instance, ensure_ascii=False)[:80]
+            message += f" (got: {instance_repr})"
+        errors.append(ValidationError(field_path=field_path, message=message))
+    return errors
 
-        Returns
-        -------
-        Tuple[bool, List[ValidationErrorDetail]]
-            ``(True, [])`` when validation succeeds.
-            ``(False, [errors...])`` when validation fails.
 
-        Raises
-        ------
-        ValueError
-            If *data* cannot be parsed as JSON.
-        TypeError
-            If *data* is not of a supported type.
-        """
-        instance = self._ensure_dict(data)
+# --------------------------------------------------------------------------- #
+# Public API
+# --------------------------------------------------------------------------- #
 
-        errors = sorted(self._validator.iter_errors(instance), key=lambda e: e.path)
-        if not errors:
-            return True, []
 
-        detailed_errors = [self._format_error(err) for err in errors]
-        return False, detailed_errors
+def load_schema(source: Union[str, pathlib.Path, Mapping[str, Any]]) -> Mapping[str, Any]:
+    """Load a JSON schema from a file path or a ready‑made dictionary.
 
-    @staticmethod
-    def _ensure_dict(data: Union[Dict[str, Any], str, bytes]) -> Dict[str, Any]:
-        """Parse input data into a dictionary or raise a helpful exception."""
-        if isinstance(data, dict):
-            return data
+    Parameters
+    ----------
+    source:
+        Either a path to a JSON schema file or a dictionary representing the
+        schema directly.
 
-        if isinstance(data, (str, bytes)):
-            try:
-                return json.loads(data)
-            except json.JSONDecodeError as e:
-                raise ValueError("Provided data is not valid JSON.") from e
+    Returns
+    -------
+    Mapping[str, Any]
+        The parsed JSON schema.
 
-        raise TypeError("Data must be a dict, JSON string, or bytes.")
+    Raises
+    ------
+    TypeError
+        If *source* is of an unsupported type.
+    FileNotFoundError, json.JSONDecodeError
+        Propagated from the underlying file‑reading routine.
+    """
+    if isinstance(source, (str, pathlib.Path)):
+        return _load_json_file(source)
+    if isinstance(source, Mapping):
+        # Defensive copy to avoid accidental mutation by callers.
+        return dict(source)
+    raise TypeError(
+        f"Unsupported schema source type: {type(source)!r}. "
+        "Expected a file path or a mapping."
+    )
+
+
+def validate_json(
+    data: Mapping[str, Any],
+    schema: Mapping[str, Any],
+) -> List[ValidationError]:
+    """Validate *data* against *schema* and return any errors found.
+
+    This function uses the Draft‑7 JSON Schema specification via the
+    ``jsonschema`` library. It checks required properties, data types,
+    string patterns, numeric ranges, array constraints, etc., as defined
+    by the supplied schema.
+
+    Parameters
+    ----------
+    data:
+        The JSON document (as a Python mapping) to validate.
+    schema:
+        The JSON Schema definition.
+
+    Returns
+    -------
+    List[ValidationError]
+        A list of validation problems; empty when the document conforms.
+
+    Raises
+    ------
+    jsonschema.SchemaError
+        If the provided schema itself is invalid.
+    TypeError
+        If *data* or *schema* is not a mapping.
+    """
+    if not isinstance(data, Mapping):
+        raise TypeError(f"data must be a mapping, got {type(data)!r}")
+    if not isinstance(schema, Mapping):
+        raise TypeError(f"schema must be a mapping, got {type(schema)!r}")
+
+    # jsonschema may raise SchemaError for malformed schemas – let it propagate.
+    validator = Draft7Validator(schema)
+
+    return _collect_errors(validator, data)
+
+
+def validate_json_file(
+    json_path: Union[str, pathlib.Path],
+    schema_source: Union[str, pathlib.Path, Mapping[str, Any]],
+) -> List[ValidationError]:
+    """Convenience wrapper to validate a JSON file against a schema.
+
+    Parameters
+    ----------
+    json_path:
+        Path to the JSON document to validate.
+    schema_source:
+        Either a path to a JSON Schema file or a dictionary representing the
+        schema.
+
+    Returns
+    -------
+    List[ValidationError]
+        Validation errors, if any.
+
+    Raises
+    ------
+    FileNotFoundError, json.JSONDecodeError
+        If the JSON document cannot be read or parsed.
+    jsonschema.SchemaError
+        If the schema is invalid.
+    """
+    data = _load_json_file(json_path)
+    schema = load_schema(schema_source)
+    return validate_json(data, schema)
 
 
 # --------------------------------------------------------------------------- #
@@ -179,50 +235,34 @@ class JsonValidator:
 # --------------------------------------------------------------------------- #
 
 
-if __name__ == "__main__":
-    # Example schema with required fields, types, and a regex pattern.
+def _example() -> None:
+    """Run a tiny demonstration when the module is executed directly."""
     example_schema = {
         "type": "object",
+        "required": ["name", "email"],
         "properties": {
-            "username": {
+            "name": {"type": "string", "minLength": 1},
+            "email": {
                 "type": "string",
-                "pattern": r"^[a-zA-Z0-9_]{3,30}$",
-                "description": "Alphanumeric username between 3 and 30 characters.",
+                "format": "email",
+                "pattern": r"^[^@\\s]+@[^@\\s]+\\.[^@\\s]+$",
             },
             "age": {"type": "integer", "minimum": 0},
-            "email": {"type": "string", "format": "email"},
-            "profile": {
-                "type": "object",
-                "properties": {"bio": {"type": "string", "maxLength": 200}},
-                "required": ["bio"],
-                "additionalProperties": False,
-            },
         },
-        "required": ["username", "age"],
         "additionalProperties": False,
     }
 
-    validator = JsonValidator(example_schema)
+    valid_data = {"name": "Alice", "email": "alice@example.com", "age": 30}
+    invalid_data = {"name": "", "email": "not-an-email", "extra": "field"}
 
-    # Valid payload
-    valid_payload = {
-        "username": "alice_01",
-        "age": 28,
-        "email": "alice@example.com",
-        "profile": {"bio": "Hello world!"},
-    }
+    print("Validating correct data:")
+    for err in validate_json(valid_data, example_schema):
+        print(f"- {err.field_path}: {err.message}")
 
-    ok, errors = validator.validate(valid_payload)
-    print("Valid payload:", ok)  # Expected: True
+    print("\nValidating incorrect data:")
+    for err in validate_json(invalid_data, example_schema):
+        print(f"- {err.field_path}: {err.message}")
 
-    # Invalid payload
-    invalid_payload = {
-        "username": "a!",  # fails pattern
-        "age": -5,  # fails minimum
-        "extra": "not allowed",  # fails additionalProperties
-    }
 
-    ok, errors = validator.validate(invalid_payload)
-    print("Invalid payload:", ok)  # Expected: False
-    for err in errors:
-        print(f"Error at {err.path or '/'}: {err.message} (validator: {err.validator})")
+if __name__ == "__main__":
+    _example()

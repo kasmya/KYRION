@@ -1,86 +1,69 @@
 """
-Password Manager Implementation
-================================
+password_manager.py
 
-Features
---------
-- Secure storage of passwords using AES‑GCM (via ``cryptography``).
-- Master‑password based authentication (key derived with PBKDF2‑HMAC‑SHA256).
-- Add / edit / delete password entries.
-- Random password generator.
-- Typed public API with docstrings and thorough error handling.
+A simple, file‑based password manager with AES‑GCM encryption.
+Features:
+- Master password authentication (derived key via PBKDF2‑HMAC‑SHA256)
+- Add / edit / delete / retrieve entries
+- Secure random password generation
+- JSON‑based storage encrypted with a single AES‑GCM ciphertext
 
-Only the ``cryptography`` package from PyPI is required in addition to the
-standard library.
+Only the Python standard library and the widely‑used ``cryptography`` package are required.
 """
 
 from __future__ import annotations
 
+import base64
 import json
 import os
-import secrets
-import string
-from base64 import b64encode, b64decode
 from dataclasses import dataclass, asdict
 from pathlib import Path
-from typing import Dict, Optional, Any
+from secrets import choice, token_bytes, token_urlsafe
+from typing import Any, Dict, List, Optional
 
+from cryptography.hazmat.primitives.ciphers.aead import AESGCM
 from cryptography.hazmat.primitives import hashes, serialization
 from cryptography.hazmat.primitives.kdf.pbkdf2 import PBKDF2HMAC
-from cryptography.hazmat.primitives.ciphers.aead import AESGCM
+
 
 # --------------------------------------------------------------------------- #
 # Exceptions
 # --------------------------------------------------------------------------- #
-
-
 class PasswordManagerError(Exception):
     """Base class for all password manager errors."""
 
 
 class AuthenticationError(PasswordManagerError):
-    """Raised when the master password is incorrect."""
+    """Raised when master‑password verification fails."""
 
 
 class EntryNotFoundError(PasswordManagerError):
     """Raised when a requested entry does not exist."""
 
 
-class CorruptedStoreError(PasswordManagerError):
-    """Raised when the encrypted store cannot be decrypted or is malformed."""
+class StorageError(PasswordManagerError):
+    """Raised for I/O or data‑corruption problems."""
 
 
 # --------------------------------------------------------------------------- #
 # Data structures
 # --------------------------------------------------------------------------- #
-
-
 @dataclass
-class PasswordEntry:
-    """
-    Represents a single password record.
+class Entry:
+    """A single password entry."""
 
-    Attributes
-    ----------
-    service: Name of the service / site.
-    username: Username for the service.
-    password: Encrypted password (plaintext in memory, stored encrypted).
-    notes: Optional free‑form notes.
-    """
-    service: str
     username: str
     password: str
     notes: str = ""
 
     def to_dict(self) -> Dict[str, str]:
-        """Serialize entry to a JSON‑compatible dict."""
+        """Convert the entry to a JSON‑serialisable dict."""
         return asdict(self)
 
     @staticmethod
-    def from_dict(data: Dict[str, Any]) -> "PasswordEntry":
-        """Create a :class:`PasswordEntry` from a dict."""
-        return PasswordEntry(
-            service=data["service"],
+    def from_dict(data: Dict[str, Any]) -> "Entry":
+        """Create an Entry from a dict."""
+        return Entry(
             username=data["username"],
             password=data["password"],
             notes=data.get("notes", ""),
@@ -88,450 +71,435 @@ class PasswordEntry:
 
 
 # --------------------------------------------------------------------------- #
-# Utility functions
+# Core manager
 # --------------------------------------------------------------------------- #
-
-
-def _derive_key(master_password: str, salt: bytes, iterations: int = 200_000) -> bytes:
-    """
-    Derive a 256‑bit AES key from the master password using PBKDF2‑HMAC‑SHA256.
-
-    Parameters
-    ----------
-    master_password: The master password supplied by the user.
-    salt: Random‑generated 16‑byte salt.
-    iterations: Number of PBKDF2 iterations (default 200k).
-
-    Returns
-    -------
-    32‑byte key suitable for AES‑GCM.
-    """
-    kdf = PBKDF2HMAC(
-        algorithm=hashes.SHA256(),
-        length=32,
-        salt=salt,
-        iterations=iterations,
-    )
-    return kdf.derive(master_password.encode("utf-8"))
-
-
-def _encrypt(plaintext: bytes, key: bytes) -> bytes:
-    """
-    Encrypt data with AES‑GCM.
-
-    Returns
-    -------
-    A bytes object: ``nonce || ciphertext || tag``.
-    """
-    nonce = secrets.token_bytes(12)  # 96‑bit nonce recommended for GCM
-    aesgcm = AESGCM(key)
-    ciphertext = aesgcm.encrypt(nonce, plaintext, associated_data=None)
-    return nonce + ciphertext  # ciphertext already contains the tag
-
-
-def _decrypt(ciphertext: bytes, key: bytes) -> bytes:
-    """
-    Decrypt data produced by :func:`_encrypt`.
-
-    Parameters
-    ----------
-    ciphertext: ``nonce || ciphertext || tag``.
-    key: AES‑GCM key.
-
-    Returns
-    -------
-    The original plaintext.
-    """
-    if len(ciphertext) < 12:
-        raise CorruptedStoreError("Ciphertext too short.")
-    nonce = ciphertext[:12]
-    ct = ciphertext[12:]
-    aesgcm = AESGCM(key)
-    return aesgcm.decrypt(nonce, ct, associated_data=None)
-
-
-def _load_json(data: bytes) -> Dict[str, Any]:
-    """Decode UTF‑8 JSON bytes to a Python dict."""
-    try:
-        return json.loads(data.decode("utf-8"))
-    except (UnicodeDecodeError, json.JSONDecodeError) as exc:
-        raise CorruptedStoreError("Failed to decode JSON data.") from exc
-
-
-def _dump_json(obj: Dict[str, Any]) -> bytes:
-    """Encode Python dict to UTF‑8 JSON bytes."""
-    return json.dumps(obj, indent=2, sort_keys=True).encode("utf-8")
-
-
-# --------------------------------------------------------------------------- #
-# Core password manager
-# --------------------------------------------------------------------------- #
-
-
 class PasswordManager:
     """
-    Password manager handling encrypted storage and entry manipulation.
+    Manage encrypted storage of password entries.
 
-    Example
-    -------
-    >>> pm = PasswordManager(Path("vault.bin"))
-    >>> pm.unlock("my_master_password")
-    >>> pm.add_entry("example.com", "alice", "s3cr3t")
-    >>> pm.save()
+    The storage file contains a JSON object with the following keys:
+        - ``salt``   : base64‑encoded PBKDF2 salt
+        - ``nonce``  : base64‑encoded AES‑GCM nonce
+        - ``cipher`` : base64‑encoded ciphertext (JSON of entries)
     """
 
-    _SALT_SIZE = 16
-    _VERSION = 1  # future‑proofing for format changes
+    _KDF_ITERATIONS = 200_000
+    _AES_KEY_SIZE = 32  # 256‑bit
+    _NONCE_SIZE = 12    # AES‑GCM recommended size
 
-    def __init__(self, store_path: Path) -> None:
+    def __init__(self, storage_path: str) -> None:
         """
-        Parameters
-        ----------
-        store_path: Path to the encrypted vault file. The file will be created
-                    on first ``save()`` if it does not exist.
+        Initialise the manager.
+
+        Args:
+            storage_path: Path to the encrypted JSON storage file.
         """
-        self.store_path = store_path.expanduser().resolve()
+        self.storage_path = Path(storage_path).expanduser().resolve()
         self._key: Optional[bytes] = None
-        self._entries: Dict[str, PasswordEntry] = {}
-        self._salt: Optional[bytes] = None
-
-        if self.store_path.is_file():
-            self._load_header()
+        self._entries: Dict[str, Entry] = {}
 
     # ------------------------------------------------------------------- #
-    # Internal helpers
+    # Key derivation & encryption helpers
     # ------------------------------------------------------------------- #
-
-    def _load_header(self) -> None:
-        """Read the file header (version + salt) without attempting decryption."""
-        try:
-            with self.store_path.open("rb") as f:
-                header = f.read(1 + self._SALT_SIZE)
-            if len(header) != 1 + self._SALT_SIZE:
-                raise CorruptedStoreError("Header size mismatch.")
-            version = header[0]
-            if version != self._VERSION:
-                raise CorruptedStoreError(f"Unsupported vault version: {version}")
-            self._salt = header[1:]
-        except OSError as exc:
-            raise PasswordManagerError(f"Failed to read vault file: {exc}") from exc
-
-    def _ensure_unlocked(self) -> None:
-        if self._key is None:
-            raise AuthenticationError("Vault is locked. Call 'unlock' first.")
-
-    # ------------------------------------------------------------------- #
-    # Public API
-    # ------------------------------------------------------------------- #
-
-    def unlock(self, master_password: str) -> None:
+    @staticmethod
+    def _derive_key(password: str, salt: bytes) -> bytes:
         """
-        Derive the encryption key from the master password and decrypt the store.
+        Derive a symmetric key from a password and salt using PBKDF2‑HMAC‑SHA256.
 
-        Parameters
-        ----------
-        master_password: The master password supplied by the user.
+        Args:
+            password: Master password.
+            salt: Randomly generated salt.
+
+        Returns:
+            A 256‑bit key suitable for AES‑GCM.
         """
-        if not self.store_path.is_file():
-            # First‑time use – generate a random salt and start with empty store.
-            self._salt = secrets.token_bytes(self._SALT_SIZE)
-            self._key = _derive_key(master_password, self._salt)
-            self._entries = {}
-            return
+        kdf = PBKDF2HMAC(
+            algorithm=hashes.SHA256(),
+            length=PasswordManager._AES_KEY_SIZE,
+            salt=salt,
+            iterations=PasswordManager._KDF_ITERATIONS,
+        )
+        return kdf.derive(password.encode("utf-8"))
 
-        if self._salt is None:
-            self._load_header()
+    @staticmethod
+    def _encrypt(key: bytes, plaintext: bytes) -> Dict[str, str]:
+        """
+        Encrypt plaintext with AES‑GCM.
 
-        assert self._salt is not None  # for mypy
+        Returns a dict containing base64‑encoded ``nonce`` and ``ciphertext``.
+        """
+        nonce = token_bytes(PasswordManager._NONCE_SIZE)
+        aesgcm = AESGCM(key)
+        ciphertext = aesgcm.encrypt(nonce, plaintext, associated_data=None)
+        return {
+            "nonce": base64.b64encode(nonce).decode("utf-8"),
+            "cipher": base64.b64encode(ciphertext).decode("utf-8"),
+        }
 
-        key = _derive_key(master_password, self._salt)
+    @staticmethod
+    def _decrypt(key: bytes, nonce_b64: str, cipher_b64: str) -> bytes:
+        """
+        Decrypt AES‑GCM ciphertext.
+
+        Raises:
+            AuthenticationError: If decryption fails (e.g., wrong key or tampered data).
+        """
         try:
-            with self.store_path.open("rb") as f:
-                f.seek(1 + self._SALT_SIZE)  # skip header
-                encrypted_blob = f.read()
-            plaintext = _decrypt(encrypted_blob, key)
-            data = _load_json(plaintext)
-            entries = data.get("entries", {})
+            nonce = base64.b64decode(nonce_b64)
+            ciphertext = base64.b64decode(cipher_b64)
+            aesgcm = AESGCM(key)
+            return aesgcm.decrypt(nonce, ciphertext, associated_data=None)
+        except Exception as exc:
+            raise AuthenticationError("Failed to decrypt storage.") from exc
+
+    # ------------------------------------------------------------------- #
+    # Storage handling
+    # ------------------------------------------------------------------- #
+    def _load_storage(self, password: str) -> None:
+        """
+        Load and decrypt the storage file using the supplied master password.
+
+        Populates ``self._entries`` and ``self._key`` on success.
+
+        Raises:
+            AuthenticationError: If password is incorrect.
+            StorageError: For I/O or format problems.
+        """
+        if not self.storage_path.is_file():
+            raise StorageError(f"Storage file '{self.storage_path}' does not exist.")
+
+        try:
+            with self.storage_path.open("r", encoding="utf-8") as f:
+                data = json.load(f)
+            salt = base64.b64decode(data["salt"])
+            key = self._derive_key(password, salt)
+            plaintext = self._decrypt(key, data["nonce"], data["cipher"])
+            entries_raw = json.loads(plaintext.decode("utf-8"))
             self._entries = {
-                service: PasswordEntry.from_dict(entry_dict)
-                for service, entry_dict in entries.items()
+                name: Entry.from_dict(entry_dict)
+                for name, entry_dict in entries_raw.items()
             }
             self._key = key
-        except (CorruptedStoreError, AuthenticationError) as exc:
-            raise AuthenticationError("Invalid master password or corrupted vault.") from exc
-        except OSError as exc:
-            raise PasswordManagerError(f"Failed to read vault file: {exc}") from exc
+        except (KeyError, json.JSONDecodeError) as exc:
+            raise StorageError("Corrupted storage format.") from exc
+        except AuthenticationError:
+            raise
+        except Exception as exc:
+            raise StorageError("Unable to read storage.") from exc
 
-    def lock(self) -> None:
-        """Erase the in‑memory key and entries."""
-        self._key = None
-        self._entries = {}
-        self._salt = None
+    def _save_storage(self) -> None:
+        """
+        Encrypt current entries and write to the storage file.
 
-    def save(self) -> None:
-        """Encrypt current entries and write them to disk."""
-        self._ensure_unlocked()
-        assert self._key is not None and self._salt is not None
+        Requires that ``self._key`` and ``self._key_salt`` are already set.
 
-        data = {"entries": {svc: entry.to_dict() for svc, entry in self._entries.items()}}
-        plaintext = _dump_json(data)
-        encrypted_blob = _encrypt(plaintext, self._key)
-
+        Raises:
+            StorageError: If writing fails.
+        """
+        if self._key is None:
+            raise StorageError("Encryption key not initialised.")
         try:
-            with self.store_path.open("wb") as f:
-                # Header: 1 byte version + 16 byte salt
-                f.write(bytes([self._VERSION]) + self._salt + encrypted_blob)
-        except OSError as exc:
-            raise PasswordManagerError(f"Failed to write vault file: {exc}") from exc
+            entries_dict = {name: entry.to_dict() for name, entry in self._entries.items()}
+            plaintext = json.dumps(entries_dict, ensure_ascii=False).encode("utf-8")
+            encrypted = self._encrypt(self._key, plaintext)
+
+            # The salt used for key derivation is stored alongside the ciphertext.
+            # For a new storage file we generate a new salt; otherwise reuse existing.
+            if not self.storage_path.is_file():
+                # First‑time creation: generate a fresh salt.
+                salt = token_bytes(16)
+                # Re‑derive key with this new salt for consistency.
+                self._key = self._derive_key(self._master_password, salt)  # type: ignore
+            else:
+                # Load existing salt from file.
+                with self.storage_path.open("r", encoding="utf-8") as f:
+                    existing = json.load(f)
+                salt = base64.b64decode(existing["salt"])
+
+            payload = {
+                "salt": base64.b64encode(salt).decode("utf-8"),
+                "nonce": encrypted["nonce"],
+                "cipher": encrypted["cipher"],
+            }
+            with self.storage_path.open("w", encoding="utf-8") as f:
+                json.dump(payload, f, indent=2)
+        except Exception as exc:
+            raise StorageError("Failed to write encrypted storage.") from exc
 
     # ------------------------------------------------------------------- #
-    # Entry manipulation
+    # Authentication API
     # ------------------------------------------------------------------- #
-
-    def add_entry(self, service: str, username: str, password: str, notes: str = "") -> None:
+    def initialize_storage(self, master_password: str) -> None:
         """
-        Add a new password entry. Overwrites existing entry for the same service.
+        Create a brand‑new encrypted storage file.
 
-        Parameters
-        ----------
-        service: Identifier for the service (e.g., domain name).
-        username: Username for the service.
-        password: Password in plain text.
-        notes: Optional notes.
+        Overwrites any existing file after confirmation.
+
+        Args:
+            master_password: Desired master password.
+
+        Raises:
+            StorageError: If the file cannot be written.
         """
-        self._ensure_unlocked()
-        self._entries[service] = PasswordEntry(service, username, password, notes)
+        if self.storage_path.is_file():
+            raise StorageError("Storage already exists; use 'reset_storage' to overwrite.")
+        self._master_password = master_password  # Temporary attribute for key derivation
+        self._entries = {}
+        self._key = self._derive_key(master_password, token_bytes(16))
+        self._save_storage()
+        del self._master_password  # Remove temporary attribute
+
+    def reset_storage(self, master_password: str) -> None:
+        """
+        Delete existing storage and create a fresh one.
+
+        Use with extreme caution – all data will be lost.
+
+        Args:
+            master_password: New master password.
+
+        Raises:
+            StorageError: If deletion or creation fails.
+        """
+        try:
+            if self.storage_path.is_file():
+                self.storage_path.unlink()
+        except Exception as exc:
+            raise StorageError("Failed to delete existing storage.") from exc
+        self.initialize_storage(master_password)
+
+    def authenticate(self, master_password: str) -> None:
+        """
+        Verify the master password and load entries into memory.
+
+        Args:
+            master_password: The password to verify.
+
+        Raises:
+            AuthenticationError: If password is incorrect.
+            StorageError: If loading fails.
+        """
+        self._load_storage(master_password)
+
+    # ------------------------------------------------------------------- #
+    # Entry management
+    # ------------------------------------------------------------------- #
+    def add_entry(self, name: str, username: str, password: str, notes: str = "") -> None:
+        """
+        Add a new entry.
+
+        Args:
+            name: Identifier for the entry (must be unique).
+            username: Username for the service.
+            password: Password for the service.
+            notes: Optional free‑form notes.
+
+        Raises:
+            ValueError: If an entry with ``name`` already exists.
+            StorageError: If saving fails.
+        """
+        if name in self._entries:
+            raise ValueError(f"Entry '{name}' already exists.")
+        self._entries[name] = Entry(username=username, password=password, notes=notes)
+        self._save_storage()
 
     def edit_entry(
         self,
-        service: str,
-        *,
+        name: str,
         username: Optional[str] = None,
         password: Optional[str] = None,
         notes: Optional[str] = None,
     ) -> None:
         """
-        Edit an existing entry. Only provided fields are updated.
+        Edit an existing entry.
 
-        Parameters
-        ----------
-        service: Service identifier of the entry to modify.
-        username: New username (optional).
-        password: New password (optional).
-        notes: New notes (optional).
+        Only supplied fields are updated.
 
-        Raises
-        ------
-        EntryNotFoundError: If the requested service does not exist.
+        Args:
+            name: Entry identifier.
+            username: New username (optional).
+            password: New password (optional).
+            notes: New notes (optional).
+
+        Raises:
+            EntryNotFoundError: If ``name`` does not exist.
+            StorageError: If saving fails.
         """
-        self._ensure_unlocked()
-        entry = self._entries.get(service)
-        if entry is None:
-            raise EntryNotFoundError(f"No entry for service: {service}")
-
+        if name not in self._entries:
+            raise EntryNotFoundError(f"Entry '{name}' not found.")
+        entry = self._entries[name]
         if username is not None:
             entry.username = username
         if password is not None:
             entry.password = password
         if notes is not None:
             entry.notes = notes
+        self._save_storage()
 
-    def delete_entry(self, service: str) -> None:
+    def delete_entry(self, name: str) -> None:
         """
-        Delete an entry identified by its service name.
+        Remove an entry.
 
-        Raises
-        ------
-        EntryNotFoundError: If the entry does not exist.
+        Args:
+            name: Entry identifier.
+
+        Raises:
+            EntryNotFoundError: If ``name`` does not exist.
+            StorageError: If saving fails.
         """
-        self._ensure_unlocked()
-        try:
-            del self._entries[service]
-        except KeyError as exc:
-            raise EntryNotFoundError(f"No entry for service: {service}") from exc
+        if name not in self._entries:
+            raise EntryNotFoundError(f"Entry '{name}' not found.")
+        del self._entries[name]
+        self._save_storage()
 
-    def get_entry(self, service: str) -> PasswordEntry:
+    def get_entry(self, name: str) -> Entry:
         """
-        Retrieve a copy of the entry for the given service.
+        Retrieve a copy of an entry.
 
-        Raises
-        ------
-        EntryNotFoundError: If the entry does not exist.
+        Args:
+            name: Entry identifier.
+
+        Returns:
+            An ``Entry`` instance.
+
+        Raises:
+            EntryNotFoundError: If ``name`` does not exist.
         """
-        self._ensure_unlocked()
-        try:
-            # Return a shallow copy to avoid accidental mutation without explicit edit.
-            entry = self._entries[service]
-            return PasswordEntry(**asdict(entry))
-        except KeyError as exc:
-            raise EntryNotFoundError(f"No entry for service: {service}") from exc
+        if name not in self._entries:
+            raise EntryNotFoundError(f"Entry '{name}' not found.")
+        # Return a shallow copy to prevent accidental mutation.
+        entry = self._entries[name]
+        return Entry(username=entry.username, password=entry.password, notes=entry.notes)
 
-    def list_services(self) -> list[str]:
-        """Return a sorted list of all stored service identifiers."""
-        self._ensure_unlocked()
+    def list_entries(self) -> List[str]:
+        """
+        List all stored entry names.
+
+        Returns:
+            Sorted list of entry identifiers.
+        """
         return sorted(self._entries.keys())
 
     # ------------------------------------------------------------------- #
-    # Password generation utilities
+    # Password generation
     # ------------------------------------------------------------------- #
-
     @staticmethod
     def generate_password(
         length: int = 16,
-        *,
-        uppercase: bool = True,
-        lowercase: bool = True,
-        digits: bool = True,
-        punctuation: bool = True,
+        use_upper: bool = True,
+        use_lower: bool = True,
+        use_digits: bool = True,
+        use_symbols: bool = True,
     ) -> str:
         """
         Generate a random password.
 
-        Parameters
-        ----------
-        length: Desired length of the password (minimum 8).
-        uppercase: Include uppercase ASCII letters.
-        lowercase: Include lowercase ASCII letters.
-        digits: Include decimal digits.
-        punctuation: Include punctuation characters defined by ``string.punctuation``.
+        Args:
+            length: Desired length (minimum 8).
+            use_upper: Include uppercase letters.
+            use_lower: Include lowercase letters.
+            use_digits: Include decimal digits.
+            use_symbols: Include punctuation symbols.
 
-        Returns
-        -------
-        Randomly generated password string.
+        Returns:
+            A securely generated password string.
 
-        Raises
-        ------
-        ValueError: If the character set is empty or length is < 8.
+        Raises:
+            ValueError: If no character sets are selected or length is too short.
         """
         if length < 8:
-            raise ValueError("Password length must be at least 8 characters.")
-
+            raise ValueError("Password length should be at least 8 characters.")
         charset = ""
-        if uppercase:
-            charset += string.ascii_uppercase
-        if lowercase:
-            charset += string.ascii_lowercase
-        if digits:
-            charset += string.digits
-        if punctuation:
-            charset += string.punctuation
-
+        if use_upper:
+            charset += "ABCDEFGHIJKLMNOPQRSTUVWXYZ"
+        if use_lower:
+            charset += "abcdefghijklmnopqrstuvwxyz"
+        if use_digits:
+            charset += "0123456789"
+        if use_symbols:
+            charset += "!@#$%^&*()-_=+[]{}|;:,.<>?/`~"
         if not charset:
-            raise ValueError("At least one character class must be selected.")
+            raise ValueError("At least one character set must be selected.")
+        return "".join(choice(charset) for _ in range(length))
 
-        # Ensure the password contains at least one character from each selected class
-        mandatory = []
-        if uppercase:
-            mandatory.append(secrets.choice(string.ascii_uppercase))
-        if lowercase:
-            mandatory.append(secrets.choice(string.ascii_lowercase))
-        if digits:
-            mandatory.append(secrets.choice(string.digits))
-        if punctuation:
-            mandatory.append(secrets.choice(string.punctuation))
-
-        # Fill the rest of the password
-        remaining = [secrets.choice(charset) for _ in range(length - len(mandatory))]
-        password_chars = mandatory + remaining
-        secrets.SystemRandom().shuffle(password_chars)
-        return "".join(password_chars)
 
 # --------------------------------------------------------------------------- #
-# Simple command‑line interface (optional but helpful for quick testing)
+# Convenience functions for command‑line usage (optional)
 # --------------------------------------------------------------------------- #
-
-if __name__ == "__main__":
-    import argparse
+def _demo() -> None:
+    """
+    Simple demonstration when the module is executed directly.
+    """
     import getpass
 
-    def _print_entry(entry: PasswordEntry) -> None:
-        print(f"Service : {entry.service}")
-        print(f"Username: {entry.username}")
-        print(f"Password: {entry.password}")
-        if entry.notes:
-            print(f"Notes   : {entry.notes}")
+    storage = PasswordManager("~/.pwmanager_store.json")
+    if not storage.storage_path.is_file():
+        print("No existing storage found. Creating new one.")
+        pwd = getpass.getpass("Set master password: ")
+        storage.initialize_storage(pwd)
+    else:
+        pwd = getpass.getpass("Master password: ")
+        try:
+            storage.authenticate(pwd)
+        except AuthenticationError as e:
+            print(f"Authentication failed: {e}")
+            return
 
-    parser = argparse.ArgumentParser(description="Secure password manager")
-    parser.add_argument("vault", type=Path, help="Path to encrypted vault file")
-    subparsers = parser.add_subparsers(dest="command", required=True)
+    while True:
+        print("\nOptions: [a]dd, [e]dit, [d]elete, [l]ist, [g]et, [p]assword gen, [q]uit")
+        choice_opt = input("Select: ").strip().lower()
+        if choice_opt == "q":
+            break
+        elif choice_opt == "a":
+            name = input("Entry name: ").strip()
+            username = input("Username: ").strip()
+            password = getpass.getpass("Password: ")
+            notes = input("Notes (optional): ").strip()
+            try:
+                storage.add_entry(name, username, password, notes)
+                print("Entry added.")
+            except Exception as exc:
+                print(f"Error: {exc}")
+        elif choice_opt == "e":
+            name = input("Entry name to edit: ").strip()
+            username = input("New username (leave empty to keep): ").strip() or None
+            password = getpass.getpass("New password (leave empty to keep): ").strip() or None
+            notes = input("New notes (leave empty to keep): ").strip() or None
+            try:
+                storage.edit_entry(name, username, password, notes)
+                print("Entry updated.")
+            except Exception as exc:
+                print(f"Error: {exc}")
+        elif choice_opt == "d":
+            name = input("Entry name to delete: ").strip()
+            try:
+                storage.delete_entry(name)
+                print("Entry deleted.")
+            except Exception as exc:
+                print(f"Error: {exc}")
+        elif choice_opt == "l":
+            print("Stored entries:")
+            for n in storage.list_entries():
+                print(f" - {n}")
+        elif choice_opt == "g":
+            name = input("Entry name to retrieve: ").strip()
+            try:
+                entry = storage.get_entry(name)
+                print(f"Username: {entry.username}")
+                print(f"Password: {entry.password}")
+                print(f"Notes: {entry.notes}")
+            except Exception as exc:
+                print(f"Error: {exc}")
+        elif choice_opt == "p":
+            try:
+                length = int(input("Length (default 16): ").strip() or "16")
+                pwd = storage.generate_password(length=length)
+                print(f"Generated password: {pwd}")
+            except Exception as exc:
+                print(f"Error: {exc}")
+        else:
+            print("Unknown option.")
 
-    # unlock (implicit for every operation)
-    # add
-    parser_add = subparsers.add_parser("add", help="Add a new entry")
-    parser_add.add_argument("service")
-    parser_add.add_argument("username")
-    parser_add.add_argument("password", nargs="?")
-    parser_add.add_argument("--notes", default="")
 
-    # edit
-    parser_edit = subparsers.add_parser("edit", help="Edit existing entry")
-    parser_edit.add_argument("service")
-    parser_edit.add_argument("--username")
-    parser_edit.add_argument("--password")
-    parser_edit.add_argument("--notes")
-
-    # delete
-    parser_del = subparsers.add_parser("delete", help="Delete an entry")
-    parser_del.add_argument("service")
-
-    # get
-    parser_get = subparsers.add_parser("get", help="Show an entry")
-    parser_get.add_argument("service")
-
-    # list
-    subparsers.add_parser("list", help="List stored services")
-
-    # gen
-    parser_gen = subparsers.add_parser("gen", help="Generate a random password")
-    parser_gen.add_argument("-l", "--length", type=int, default=16)
-    parser_gen.add_argument("--no-uppercase", action="store_false", dest="uppercase")
-    parser_gen.add_argument("--no-lowercase", action="store_false", dest="lowercase")
-    parser_gen.add_argument("--no-digits", action="store_false", dest="digits")
-    parser_gen.add_argument("--no-punct", action="store_false", dest="punctuation")
-
-    args = parser.parse_args()
-
-    master_pwd = getpass.getpass("Master password: ")
-    pm = PasswordManager(args.vault)
-    try:
-        pm.unlock(master_pwd)
-    except AuthenticationError as e:
-        print(f"Error: {e}")
-        exit(1)
-
-    try:
-        if args.command == "add":
-            pwd = args.password or getpass.getpass("Password: ")
-            pm.add_entry(args.service, args.username, pwd, notes=args.notes)
-            pm.save()
-            print("Entry added.")
-        elif args.command == "edit":
-            pm.edit_entry(
-                args.service,
-                username=args.username,
-                password=args.password,
-                notes=args.notes,
-            )
-            pm.save()
-            print("Entry updated.")
-        elif args.command == "delete":
-            pm.delete_entry(args.service)
-            pm.save()
-            print("Entry deleted.")
-        elif args.command == "get":
-            entry = pm.get_entry(args.service)
-            _print_entry(entry)
-        elif args.command == "list":
-            for svc in pm.list_services():
-                print(svc)
-        elif args.command == "gen":
-            pwd = PasswordManager.generate_password(
-                length=args.length,
-                uppercase=args.uppercase,
-                lowercase=args.lowercase,
-                digits=args.digits,
-                punctuation=args.punctuation,
-            )
-            print(pwd)
-    finally:
-        pm.lock()
+if __name__ == "__main__":
+    _demo()

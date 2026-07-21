@@ -1,31 +1,48 @@
 """
-pdf_report.py
+pdf_report_generator.py
 
-A simple PDF report generator using ReportLab and Matplotlib.
-Supports header/footer, tables, bar/line/pie charts, and multi‑page layouts.
+A lightweight PDF report generator using ReportLab and Matplotlib.
 
-Usage example:
-    generator = PDFReportGenerator("report.pdf")
-    generator.add_header("My Company • Quarterly Report")
-    generator.add_footer("Confidential • Page %(page)d")
-    generator.add_table([["Header1", "Header2"], [1, 2], [3, 4]])
-    generator.add_chart(
-        chart_type="bar",
-        data={"Category A": [5, 3, 6], "Category B": [2, 7, 4]},
-        title="Sales by Category"
+Features:
+- Automatic page headers and footers (including page numbers)
+- Insertion of data tables with optional styling
+- Embedding of bar, line, and pie charts generated from data
+- Multi‑page support with automatic page breaks
+
+Only the Python standard library and the widely‑used PyPI packages
+`reportlab` and `matplotlib` are required.
+
+Example
+-------
+    from pdf_report_generator import PDFReport, ReportError
+
+    report = PDFReport(
+        title="Sales Summary",
+        output_path="sales_report.pdf",
+        author="Acme Corp",
     )
-    generator.build()
+    report.add_header("Acme Corp – Confidential")
+    report.add_footer("Generated on 2026-07-20")
+    report.add_table(
+        data=[["Region", "Q1", "Q2", "Q3", "Q4"], ["North", 120, 130, 115, 140]],
+        column_widths=[100, 50, 50, 50, 50],
+    )
+    report.add_chart(
+        chart_type="bar",
+        data={"North": 120, "South": 95, "East": 110, "West": 130},
+        title="Quarterly Sales",
+    )
+    report.build()
 """
 
 from __future__ import annotations
 
 import io
-import os
-from typing import Any, Dict, List, Optional, Tuple
+import pathlib
+from typing import Any, Dict, Iterable, List, Mapping, Sequence, Tuple, Union
 
-import matplotlib.pyplot as plt
 from reportlab.lib import colors
-from reportlab.lib.pagesizes import A4, letter
+from reportlab.lib.pagesizes import A4, landscape, portrait
 from reportlab.lib.styles import ParagraphStyle, getSampleStyleSheet
 from reportlab.lib.units import cm, inch
 from reportlab.platypus import (
@@ -33,179 +50,299 @@ from reportlab.platypus import (
     PageBreak,
     Paragraph,
     SimpleDocTemplate,
+    Spacer,
     Table,
     TableStyle,
-    Flowable,
 )
+import matplotlib.pyplot as plt
 
-# --------------------------------------------------------------------------- #
-# Helper for secure file handling
-# --------------------------------------------------------------------------- #
-def _ensure_parent_dir(path: str) -> None:
-    """Create parent directories if they do not exist, in a safe manner."""
-    parent = os.path.abspath(os.path.dirname(path))
-    os.makedirs(parent, exist_ok=True)
+# ---------------------------------------------------------------------------
+
+class ReportError(Exception):
+    """Base exception for all report generation errors."""
 
 
-# --------------------------------------------------------------------------- #
-# PDFReportGenerator definition
-# --------------------------------------------------------------------------- #
-class PDFReportGenerator:
+# ---------------------------------------------------------------------------
+
+class PDFReport:
     """
-    PDFReportGenerator builds a PDF document with optional header/footer,
-    tables, and Matplotlib charts.
+    PDF report builder.
 
     Parameters
     ----------
-    filename: str
-        Destination PDF file path.
-    pagesize: Tuple[float, float], optional
-        Page size (default: letter). Use ``reportlab.lib.pagesizes`` constants.
+    title : str
+        Title of the report; appears in the document metadata.
+    output_path : str | pathlib.Path
+        Destination file for the generated PDF.
+    author : str, optional
+        Author name for PDF metadata.
+    page_size : tuple, optional
+        Page size in points (width, height). Defaults to A4 portrait.
+    margin : float, optional
+        Page margin in centimeters. Defaults to 2 cm.
     """
 
-    def __init__(self, filename: str, pagesize: Tuple[float, float] = letter) -> None:
-        _ensure_parent_dir(filename)
-        self.filename: str = filename
-        self.pagesize: Tuple[float, float] = pagesize
-        self.elements: List[Flowable] = []
-        self._header_text: Optional[str] = None
-        self._footer_text: Optional[str] = None
-        self.styles = getSampleStyleSheet()
-        self.normal_style: ParagraphStyle = self.styles["Normal"]
-        self.title_style: ParagraphStyle = self.styles["Title"]
+    def __init__(
+        self,
+        *,
+        title: str,
+        output_path: Union[str, pathlib.Path],
+        author: str = "",
+        page_size: Tuple[float, float] = A4,
+        margin: float = 2.0,
+    ) -> None:
+        self.title = title
+        self.author = author
+        self.page_size = page_size
+        self.margin = margin * cm
 
-    # ------------------------------------------------------------------- #
-    # Header / Footer handling
-    # ------------------------------------------------------------------- #
+        try:
+            self.output_path = pathlib.Path(output_path).expanduser().resolve(strict=False)
+            if self.output_path.is_dir():
+                raise ReportError(f"Output path '{self.output_path}' is a directory.")
+        except Exception as exc:
+            raise ReportError(f"Invalid output path: {exc}") from exc
+
+        self._elements: List[Any] = []
+        self._header: str = ""
+        self._footer: str = ""
+
+        # Styles
+        self._styles = getSampleStyleSheet()
+        self._styles.add(
+            ParagraphStyle(
+                name="HeaderFooter",
+                fontSize=9,
+                alignment=1,  # center
+                textColor=colors.grey,
+            )
+        )
+        self._styles.add(
+            ParagraphStyle(
+                name="Title",
+                fontSize=18,
+                leading=22,
+                alignment=1,
+                spaceAfter=12,
+            )
+        )
+
+    # -----------------------------------------------------------------------
+
     def add_header(self, text: str) -> None:
-        """Set header text displayed on each page."""
-        self._header_text = text
+        """
+        Set the header text displayed on every page.
+
+        Parameters
+        ----------
+        text : str
+            Header content.
+        """
+        if not isinstance(text, str):
+            raise ReportError("Header text must be a string.")
+        self._header = text
 
     def add_footer(self, text: str) -> None:
-        """Set footer text displayed on each page.
-        Use ``%(page)d`` placeholder for the page number."""
-        self._footer_text = text
+        """
+        Set the footer text displayed on every page (excluding the page number).
 
-    @staticmethod
-    def _page_decorator(canvas, doc, header: Optional[str], footer: Optional[str]) -> None:
-        """Internal callback attached to ``SimpleDocTemplate`` to render header/footer."""
-        canvas.saveState()
-        width, height = doc.pagesize
+        Parameters
+        ----------
+        text : str
+            Footer content.
+        """
+        if not isinstance(text, str):
+            raise ReportError("Footer text must be a string.")
+        self._footer = text
 
-        # Header
-        if header:
-            canvas.setFont("Helvetica", 9)
-            canvas.drawString(cm, height - cm + 5, header)
+    # -----------------------------------------------------------------------
 
-        # Footer
-        if footer:
-            canvas.setFont("Helvetica", 9)
-            page_num = canvas.getPageNumber()
-            footer_resolved = footer.replace("%(page)d", str(page_num))
-            canvas.drawString(cm, cm - 10, footer_resolved)
-
-        canvas.restoreState()
-
-    # ------------------------------------------------------------------- #
-    # Table handling
-    # ------------------------------------------------------------------- #
     def add_table(
         self,
-        data: List[List[Any]],
-        col_widths: Optional[List[float]] = None,
-        style: Optional[TableStyle] = None,
+        data: Sequence[Sequence[Any]],
+        column_widths: Sequence[float] | None = None,
+        style: TableStyle | None = None,
         repeat_rows: int = 1,
     ) -> None:
         """
-        Add a table to the report.
+        Append a table to the report.
 
         Parameters
         ----------
-        data : List[List[Any]]
-            2‑D list representing rows and columns.
-        col_widths : List[float], optional
-            Column widths in points (default: auto).
-        style : TableStyle, optional
-            Custom ReportLab TableStyle.
-        repeat_rows : int, optional
-            Number of header rows to repeat on each page.
+        data : sequence of sequences
+            Table data; first row is treated as a header.
+        column_widths : sequence of float, optional
+            Width of each column in centimeters. If omitted, widths are auto‑scaled.
+        style : reportlab.platypus.TableStyle, optional
+            Custom table style. If omitted, a default style is applied.
+        repeat_rows : int, default 1
+            Number of top rows to repeat on each new page.
         """
-        if not data or not isinstance(data, list) or not isinstance(data[0], list):
-            raise ValueError("Table data must be a non‑empty list of lists.")
+        if not data or not isinstance(data, (list, tuple)):
+            raise ReportError("Table data must be a non‑empty list or tuple.")
+        if column_widths:
+            if len(column_widths) != len(data[0]):
+                raise ReportError("Column widths length must match number of columns.")
+            col_widths_pt = [w * cm for w in column_widths]
+        else:
+            col_widths_pt = None
 
-        table = Table(data, colWidths=col_widths, repeatRows=repeat_rows)
-
-        default_style = TableStyle(
+        table_style = style or TableStyle(
             [
-                ("GRID", (0, 0), (-1, -1), 0.5, colors.grey),
                 ("BACKGROUND", (0, 0), (-1, 0), colors.lightgrey),
+                ("TEXTCOLOR", (0, 0), (-1, 0), colors.black),
                 ("ALIGN", (0, 0), (-1, -1), "CENTER"),
-                ("VALIGN", (0, 0), (-1, -1), "MIDDLE"),
+                ("GRID", (0, 0), (-1, -1), 0.5, colors.grey),
                 ("FONTNAME", (0, 0), (-1, 0), "Helvetica-Bold"),
-                ("FONTSIZE", (0, 0), (-1, -1), 9),
-                ("BOTTOMPADDING", (0, 0), (-1, -1), 4),
-                ("TOPPADDING", (0, 0), (-1, -1), 4),
+                ("BOTTOMPADDING", (0, 0), (-1, 0), 6),
             ]
         )
-        table.setStyle(style or default_style)
-        self.elements.append(table)
 
-    # ------------------------------------------------------------------- #
-    # Chart handling (Matplotlib -> ReportLab Image)
-    # ------------------------------------------------------------------- #
+        tbl = Table(data, colWidths=col_widths_pt, repeatRows=repeat_rows, hAlign="LEFT")
+        tbl.setStyle(table_style)
+
+        self._elements.append(tbl)
+        self._elements.append(Spacer(1, 0.2 * inch))
+
+    # -----------------------------------------------------------------------
+
     def add_chart(
         self,
         chart_type: str,
-        data: Dict[str, List[float]],
-        title: Optional[str] = None,
-        width: float = 6 * inch,
-        height: float = 4 * inch,
+        data: Mapping[str, float] | Sequence[float],
+        title: str = "",
+        xlabel: str = "",
+        ylabel: str = "",
+        size: Tuple[float, float] = (6, 4),
     ) -> None:
         """
-        Generate a chart with Matplotlib and embed it as an image.
+        Generate a chart with Matplotlib and embed it in the PDF.
 
         Parameters
         ----------
-        chart_type : {"bar", "line", "pie"}
+        chart_type : {'bar', 'line', 'pie'}
             Type of chart to render.
-        data : Dict[str, List[float]]
-            Mapping of series names to numeric data.
+        data : mapping or sequence
+            For ``bar`` and ``line`` charts, a mapping of labels to values.
+            For ``pie`` charts, a sequence of numeric values.
         title : str, optional
             Chart title.
-        width, height : float
-            Desired image size in points.
+        xlabel : str, optional
+            X‑axis label (ignored for pie charts).
+        ylabel : str, optional
+            Y‑axis label (ignored for pie charts).
+        size : tuple of float, optional
+            Figure size in inches (width, height). Default is (6, 4).
         """
         if chart_type not in {"bar", "line", "pie"}:
-            raise ValueError(f"Unsupported chart_type '{chart_type}'. Choose from bar, line, pie.")
+            raise ReportError(f"Unsupported chart type: {chart_type}")
 
-        # Prepare figure
-        plt.close("all")
-        fig, ax = plt.subplots(figsize=(width / inch, height / inch), dpi=96)
-
+        fig, ax = plt.subplots(figsize=size)
         try:
             if chart_type == "pie":
-                # For pie we expect a single series
-                if len(data) != 1:
-                    raise ValueError("Pie chart expects exactly one data series.")
-                label, values = next(iter(data.items()))
-                ax.pie(values, labels=label, autopct="%1.1f%%", startangle=90)
+                if not isinstance(data, (list, tuple)):
+                    raise ReportError("Pie chart data must be a sequence of numbers.")
+                ax.pie(data, autopct="%1.1f%%", startangle=90)
                 ax.axis("equal")
             else:
-                x = range(len(next(iter(data.values()))))
-                for label, values in data.items():
-                    if chart_type == "bar":
-                        ax.bar(x, values, label=label, alpha=0.7)
-                    elif chart_type == "line":
-                        ax.plot(x, values, marker="o", label=label)
-                ax.set_xticks(list(x))
-                ax.legend()
-        except Exception as exc:
+                if not isinstance(data, Mapping):
+                    raise ReportError(f"{chart_type.title()} chart data must be a mapping.")
+                labels = list(data.keys())
+                values = list(data.values())
+                indices = range(len(labels))
+                if chart_type == "bar":
+                    ax.bar(indices, values, tick_label=labels)
+                elif chart_type == "line":
+                    ax.plot(indices, values, marker="o")
+                    ax.set_xticks(indices)
+                    ax.set_xticklabels(labels)
+                ax.set_xlabel(xlabel)
+                ax.set_ylabel(ylabel)
+
+            if title:
+                ax.set_title(title)
+
+            buf = io.BytesIO()
+            plt.tight_layout()
+            fig.savefig(buf, format="png")
+            buf.seek(0)
+            img = Image(buf, width=size[0] * inch, height=size[1] * inch)
+            self._elements.append(img)
+            self._elements.append(Spacer(1, 0.2 * inch))
+        finally:
             plt.close(fig)
-            raise RuntimeError(f"Failed to generate {chart_type} chart: {exc}") from exc
 
-        if title:
-            ax.set_title(title)
+    # -----------------------------------------------------------------------
 
-        buf = io.BytesIO()
+    def build(self) -> None:
+        """
+        Assemble the document and write the PDF file.
+
+        Raises
+        ------
+        ReportError
+            If the PDF cannot be generated or written.
+        """
         try:
-            fig.savefig(buf
+            doc = SimpleDocTemplate(
+                filename=str(self.output_path),
+                pagesize=self.page_size,
+                leftMargin=self.margin,
+                rightMargin=self.margin,
+                topMargin=self.margin,
+                bottomMargin=self.margin,
+                title=self.title,
+                author=self.author,
+            )
+            doc.build(
+                self._elements,
+                onFirstPage=self._make_page_decorator(page_number=False),
+                onLaterPages=self._make_page_decorator(page_number=True),
+            )
+        except Exception as exc:
+            raise ReportError(f"Failed to build PDF: {exc}") from exc
+
+    # -----------------------------------------------------------------------
+
+    def _make_page_decorator(self, page_number: bool):
+        """
+        Create a callable for ReportLab's onPage/onPageEnd hook.
+
+        Parameters
+        ----------
+        page_number : bool
+            Whether to include the page number in the footer.
+
+        Returns
+        -------
+        Callable
+            Function that draws header/footer on the canvas.
+        """
+
+        def decorator(canvas, doc):
+            canvas.saveState()
+            width, height = self.page_size
+
+            # Header
+            if self._header:
+                canvas.setFont("Helvetica", 9)
+                canvas.setFillColor(colors.grey)
+                canvas.drawCentredString(width / 2.0, height - self.margin + 0.5 * cm, self._header)
+
+            # Footer
+            footer_y = self.margin - 0.75 * cm
+            if self._footer:
+                canvas.setFont("Helvetica", 9)
+                canvas.setFillColor(colors.grey)
+                canvas.drawCentredString(width / 2.0, footer_y, self._footer)
+
+            # Page number
+            if page_number:
+                canvas.setFont("Helvetica", 9)
+                canvas.setFillColor(colors.grey)
+                page_str = f"Page {doc.page}"
+                canvas.drawRightString(width - self.margin, footer_y, page_str)
+
+            canvas.restoreState()
+
+        return decorator

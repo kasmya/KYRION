@@ -1,348 +1,293 @@
-#!/usr/bin/env python3
 """
-ETL pipeline:
-  1. Extract – read a CSV file into a pandas DataFrame.
-  2. Transform – clean data (type casting, whitespace trimming, null handling)
-                 and aggregate (example: sum of numeric columns grouped by a key).
-  3. Load – write the transformed data into a SQLite table using
-            parameterised queries (security best‑practice).
+ETL pipeline module.
 
-Only the standard library, ``pandas`` and ``sqlite3`` are used.
+This module provides a simple Extract‑Transform‑Load (ETL) pipeline that:
+1. Extracts data from a CSV file.
+2. Transforms the data by cleaning (trimming whitespace, dropping rows with missing
+   required fields) and aggregating (summing a numeric column grouped by a key).
+3. Loads the aggregated results into a SQLite database using parameterised queries.
+
+The implementation follows security best practices:
+- Uses context managers for file and database resources.
+- Performs input validation.
+- Employs parameterised SQL statements to prevent injection.
+- Handles and logs errors explicitly.
+
+Only the Python standard library and the widely‑used `pandas` package are required.
 """
 
 from __future__ import annotations
 
-import argparse
+import csv
 import logging
-import sys
-from pathlib import Path
-from typing import Final, Iterable, List, Optional
+import pathlib
+import sqlite3
+from typing import Any, Dict, List, Tuple
 
 import pandas as pd
-import sqlite3
 
-# --------------------------------------------------------------------------- #
-# Configuration & Logging
-# --------------------------------------------------------------------------- #
-
-DEFAULT_CHUNK_SIZE: Final[int] = 100_000  # rows per CSV read chunk (if needed)
-
-logging.basicConfig(
-    level=logging.INFO,
-    format="%(asctime)s [%(levelname)s] %(message)s",
-    handlers=[logging.StreamHandler(sys.stdout)],
-)
+# Configure module‑level logger
 logger = logging.getLogger(__name__)
-
-# --------------------------------------------------------------------------- #
-# Custom Exceptions
-# --------------------------------------------------------------------------- #
-
-
-class ETLException(RuntimeError):
-    """Base class for ETL related errors."""
-
-
-# --------------------------------------------------------------------------- #
-# Helper Functions
-# --------------------------------------------------------------------------- #
+logger.setLevel(logging.INFO)
+handler = logging.StreamHandler()
+formatter = logging.Formatter(
+    fmt="%(asctime)s - %(name)s - %(levelname)s - %(message)s"
+)
+handler.setFormatter(formatter)
+logger.addHandler(handler)
 
 
-def _validate_path(file_path: Path) -> None:
-    """Ensure a path is absolute and points to an existing regular file."""
-    if not file_path.is_absolute():
-        raise ETLException(f"Path must be absolute: {file_path}")
-    if not file_path.is_file():
-        raise ETLException(f"File does not exist: {file_path}")
-
-
-def _sanitize_column_name(name: str) -> str:
+def extract(csv_path: str, *, encoding: str = "utf-8") -> pd.DataFrame:
     """
-    Return a safe SQLite column name:
-      * Strip surrounding whitespace.
-      * Replace spaces with underscores.
-      * Remove characters other than alphanumerics and underscores.
+    Extract data from a CSV file into a pandas DataFrame.
+
+    Args:
+        csv_path: Path to the source CSV file.
+        encoding: Text encoding used to read the file (default: "utf-8").
+
+    Returns:
+        DataFrame containing the CSV data.
+
+    Raises:
+        FileNotFoundError: If the CSV file does not exist.
+        PermissionError: If the file cannot be read due to permission issues.
+        pd.errors.ParserError: If pandas fails to parse the CSV.
     """
-    clean = "".join(ch if ch.isalnum() or ch == "_" else "_" for ch in name.strip())
-    return clean
+    path = pathlib.Path(csv_path)
+    if not path.is_file():
+        logger.error("CSV file not found: %s", csv_path)
+        raise FileNotFoundError(f"CSV file not found: {csv_path}")
 
-
-# --------------------------------------------------------------------------- #
-# ETL Steps
-# --------------------------------------------------------------------------- #
-
-
-def extract(csv_path: Path, *, encoding: str = "utf-8") -> pd.DataFrame:
-    """
-    Read a CSV file into a DataFrame.
-
-    Parameters
-    ----------
-    csv_path: Path
-        Absolute path to the CSV file.
-    encoding: str, optional
-        Encoding to use when reading the CSV (default "utf-8").
-
-    Returns
-    -------
-    pd.DataFrame
-        Raw data from the CSV.
-
-    Raises
-    ------
-    ETLException
-        If the file cannot be read.
-    """
-    _validate_path(csv_path)
     try:
-        logger.info("Extracting data from %s", csv_path)
-        df = pd.read_csv(csv_path, encoding=encoding, low_memory=False)
-        logger.info("Extracted %d rows, %d columns", df.shape[0], df.shape[1])
+        df = pd.read_csv(path, encoding=encoding, dtype=str)  # read everything as string initially
+        logger.info("Extracted %d rows from %s", len(df), csv_path)
         return df
-    except Exception as exc:
-        raise ETLException(f"Failed to read CSV at {csv_path}: {exc}") from exc
+    except PermissionError as exc:
+        logger.exception("Permission denied when reading %s", csv_path)
+        raise
+    except pd.errors.ParserError as exc:
+        logger.exception("Failed to parse CSV %s", csv_path)
+        raise
 
 
-def _clean_string(series: pd.Series) -> pd.Series:
-    """Trim whitespace and replace NaN with empty string."""
-    return series.astype(str).str.strip().replace("nan", "")
-
-
-def transform(df: pd.DataFrame) -> pd.DataFrame:
+def clean_data(
+    df: pd.DataFrame, required_fields: List[str]
+) -> pd.DataFrame:
     """
-    Clean and aggregate the raw DataFrame.
+    Clean the extracted DataFrame.
 
-    Cleaning steps:
-      * Strip whitespace from object columns.
-      * Convert numeric columns to appropriate dtypes.
-      * Drop rows where essential columns are missing.
+    The cleaning steps are:
+    * Strip leading/trailing whitespace from all string columns.
+    * Drop rows where any of the required fields are missing or empty after stripping.
 
-    Aggregation example:
-      * Group by a column named "category" (if present) and sum numeric columns.
+    Args:
+        df: Raw DataFrame from the extraction step.
+        required_fields: List of column names that must be present and non‑empty.
 
-    Parameters
-    ----------
-    df: pd.DataFrame
-        DataFrame returned by ``extract``.
+    Returns:
+        Cleaned DataFrame.
 
-    Returns
-    -------
-    pd.DataFrame
-        Cleaned and aggregated data ready for loading.
+    Raises:
+        ValueError: If any required field is not present in the DataFrame.
     """
-    if df.empty:
-        logger.warning("Received empty DataFrame – nothing to transform.")
-        return df.copy()
+    missing = set(required_fields) - set(df.columns)
+    if missing:
+        logger.error("Missing required columns: %s", missing)
+        raise ValueError(f"Missing required columns: {missing}")
 
-    logger.info("Starting transformation of %d rows.", df.shape[0])
-    df_clean = df.copy()
+    # Strip whitespace
+    df = df.applymap(lambda x: x.strip() if isinstance(x, str) else x)
 
-    # ------------------------------------------------------------------- #
-    # 1. Sanitize column names for SQLite compatibility.
-    # ------------------------------------------------------------------- #
-    original_columns = df_clean.columns.tolist()
-    sanitized = [_sanitize_column_name(col) for col in original_columns]
-    df_clean.columns = sanitized
-    logger.debug("Sanitized columns: %s", sanitized)
-
-    # ------------------------------------------------------------------- #
-    # 2. Clean string/object columns.
-    # ------------------------------------------------------------------- #
-    obj_cols = df_clean.select_dtypes(include=["object"]).columns
-    for col in obj_cols:
-        df_clean[col] = _clean_string(df_clean[col])
-    logger.debug("Cleaned %d object columns.", len(obj_cols))
-
-    # ------------------------------------------------------------------- #
-    # 3. Convert numeric columns.
-    # ------------------------------------------------------------------- #
-    for col in df_clean.columns:
-        # Skip if already numeric
-        if pd.api.types.is_numeric_dtype(df_clean[col]):
-            continue
-        try:
-            df_clean[col] = pd.to_numeric(df_clean[col], errors="coerce")
-        except Exception:
-            # Keep as original if conversion fails
-            continue
-    logger.debug("Converted columns to numeric where possible.")
-
-    # ------------------------------------------------------------------- #
-    # 4. Drop rows where essential data is missing.
-    #    (Assume a column named 'id' or the first column is essential.)
-    # ------------------------------------------------------------------- #
-    essential = "id" if "id" in df_clean.columns else df_clean.columns[0]
-    before_drop = df_clean.shape[0]
-    df_clean = df_clean.dropna(subset=[essential])
+    # Drop rows with missing required fields
+    mask = df[required_fields].applymap(lambda x: x not in (None, "", pd.NA)).all(axis=1)
+    cleaned_df = df[mask].copy()
     logger.info(
-        "Dropped %d rows missing essential column '%s'.", before_drop - df_clean.shape[0], essential
+        "Cleaned data: %d rows remaining after dropping incomplete records",
+        len(cleaned_df),
     )
-
-    # ------------------------------------------------------------------- #
-    # 5. Example aggregation: group by 'category' if present.
-    # ------------------------------------------------------------------- #
-    if "category" in df_clean.columns:
-        numeric_cols = df_clean.select_dtypes(include=["number"]).columns.tolist()
-        agg_dict = {col: "sum" for col in numeric_cols if col != "category"}
-        df_agg = (
-            df_clean.groupby("category", as_index=False)
-            .agg(agg_dict)
-            .reset_index(drop=True)
-        )
-        logger.info("Aggregated data by 'category' – %d groups.", df_agg.shape[0])
-        return df_agg
-
-    # No aggregation needed – return cleaned dataframe.
-    logger.info("Transformation complete – %d rows remain.", df_clean.shape[0])
-    return df_clean
+    return cleaned_df
 
 
-def load(
-    df: pd.DataFrame,
-    db_path: Path,
-    table_name: str,
-    *,
-    if_exists: str = "replace",
+def aggregate_data(
+    df: pd.DataFrame, group_by: str, agg_field: str
+) -> pd.DataFrame:
+    """
+    Aggregate the cleaned DataFrame.
+
+    Performs a GROUP BY on ``group_by`` and computes the sum of ``agg_field``.
+    Non‑numeric values in ``agg_field`` are coerced to ``NaN`` and ignored.
+
+    Args:
+        df: Cleaned DataFrame.
+        group_by: Column name to group by.
+        agg_field: Numeric column to aggregate.
+
+    Returns:
+        DataFrame with two columns: ``group_by`` and ``total`` (sum of ``agg_field``).
+
+    Raises:
+        ValueError: If ``group_by`` or ``agg_field`` are missing from the DataFrame.
+    """
+    for col in (group_by, agg_field):
+        if col not in df.columns:
+            logger.error("Column %s not found for aggregation", col)
+            raise ValueError(f"Column {col} not found for aggregation")
+
+    # Convert aggregation column to numeric, coercing errors to NaN
+    df[agg_field] = pd.to_numeric(df[agg_field], errors="coerce")
+    aggregated = (
+        df.groupby(group_by, as_index=False)[agg_field]
+        .sum()
+        .rename(columns={agg_field: "total"})
+    )
+    logger.info(
+        "Aggregated data: %d groups calculated from %d rows",
+        len(aggregated),
+        len(df),
+    )
+    return aggregated
+
+
+def load_to_sqlite(
+    aggregated_df: pd.DataFrame,
+    db_path: str,
+    table_name: str = "aggregated_data",
 ) -> None:
     """
-    Load a DataFrame into a SQLite database table.
+    Load the aggregated DataFrame into a SQLite database.
 
-    Parameters
-    ----------
-    df: pd.DataFrame
-        DataFrame produced by ``transform``.
-    db_path: Path
-        Absolute path to the SQLite database file. Will be created if missing.
-    table_name: str
-        Target table name.
-    if_exists: str, optional
-        How to behave if the table already exists.
-        Options: 'replace' (drop & recreate), 'append', 'fail'.
-        Default is 'replace'.
+    The target table is created if it does not exist. Existing rows with the same
+    primary key are replaced (UPSERT behaviour).
 
-    Raises
-    ------
-    ETLException
-        If any database operation fails.
+    Args:
+        aggregated_df: DataFrame produced by ``aggregate_data``.
+        db_path: Path to the SQLite database file.
+        table_name: Name of the table to store the results.
+
+    Raises:
+        sqlite3.Error: If any SQLite operation fails.
     """
-    if not db_path.is_absolute():
-        raise ETLException(f"Database path must be absolute: {db_path}")
+    path = pathlib.Path(db_path)
+    # Ensure the parent directory exists
+    if not path.parent.exists():
+        logger.info("Creating directory for SQLite DB: %s", path.parent)
+        path.parent.mkdir(parents=True, exist_ok=True)
 
     try:
-        logger.info("Connecting to SQLite database at %s", db_path)
-        with sqlite3.connect(db_path) as conn:
+        with sqlite3.connect(str(path)) as conn:
             conn.execute("PRAGMA foreign_keys = ON;")
-            placeholders = ", ".join("?" * len(df.columns))
-            columns = ", ".join(f'"{col}"' for col in df.columns)
+            # Create table with appropriate schema
+            create_stmt = f"""
+                CREATE TABLE IF NOT EXISTS {table_name} (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    group_key TEXT NOT NULL,
+                    total REAL NOT NULL,
+                    UNIQUE(group_key)
+                );
+            """
+            conn.execute(create_stmt)
 
-            if if_exists == "replace":
-                logger.info("Dropping existing table %s if it exists.", table_name)
-                conn.execute(f'DROP TABLE IF EXISTS "{table_name}"')
-                # Derive simple CREATE TABLE statement based on pandas dtypes
-                create_stmt = _generate_create_table_sql(df, table_name)
-                logger.debug("Create table statement: %s", create_stmt)
-                conn.execute(create_stmt)
-            elif if_exists == "fail":
-                # Ensure table does not exist
-                cur = conn.execute(
-                    "SELECT name FROM sqlite_master WHERE type='table' AND name=?",
-                    (table_name,),
-                )
-                if cur.fetchone():
-                    raise ETLException(f"Table '{table_name}' already exists.")
-            elif if_exists != "append":
-                raise ETLException(f"Invalid if_exists value: {if_exists}")
-
-            insert_sql = f'INSERT INTO "{table_name}" ({columns}) VALUES ({placeholders})'
-            logger.info("Inserting %d rows into %s.", df.shape[0], table_name)
-            conn.executemany(insert_sql, df.itertuples(index=False, name=None))
+            insert_stmt = f"""
+                INSERT INTO {table_name} (group_key, total)
+                VALUES (?, ?)
+                ON CONFLICT(group_key) DO UPDATE SET total=excluded.total;
+            """
+            data_to_insert = [
+                (row[0], row[1]) for row in aggregated_df.itertuples(index=False)
+            ]
+            conn.executemany(insert_stmt, data_to_insert)
             conn.commit()
-            logger.info("Load completed successfully.")
+            logger.info(
+                "Loaded %d aggregated rows into %s.%s",
+                len(data_to_insert),
+                db_path,
+                table_name,
+            )
     except sqlite3.Error as exc:
-        raise ETLException(f"SQLite error: {exc}") from exc
+        logger.exception("SQLite error while loading data")
+        raise
+
+
+def run_etl(
+    csv_path: str,
+    db_path: str,
+    required_fields: List[str],
+    group_by: str,
+    agg_field: str,
+    *,
+    encoding: str = "utf-8",
+) -> None:
+    """
+    Execute the full ETL pipeline.
+
+    This function orchestrates extraction, transformation (cleaning and aggregation),
+    and loading steps while handling and logging errors.
+
+    Args:
+        csv_path: Path to the source CSV file.
+        db_path: Path to the target SQLite database.
+        required_fields: Columns that must be present and non‑empty.
+        group_by: Column to group by during aggregation.
+        agg_field: Numeric column to sum during aggregation.
+        encoding: Encoding used for reading the CSV file (default: "utf-8").
+
+    Raises:
+        Exception: Propagates any exception raised during the pipeline.
+    """
+    try:
+        raw_df = extract(csv_path, encoding=encoding)
+        cleaned_df = clean_data(raw_df, required_fields)
+        aggregated_df = aggregate_data(cleaned_df, group_by, agg_field)
+        load_to_sqlite(aggregated_df, db_path)
+        logger.info("ETL pipeline completed successfully.")
     except Exception as exc:
-        raise ETLException(f"Failed during load phase: {exc}") from exc
+        logger.error("ETL pipeline failed: %s", exc)
+        raise
 
 
-def _generate_create_table_sql(df: pd.DataFrame, table_name: str) -> str:
-    """
-    Produce a CREATE TABLE statement based on pandas dtypes.
-    Only a subset of SQLite types is used (INTEGER, REAL, TEXT).
-    """
-    type_map = {
-        "int64": "INTEGER",
-        "float64": "REAL",
-        "object": "TEXT",
-        "bool": "INTEGER",
-        "datetime64[ns]": "TEXT",
-    }
+if __name__ == "__main__":
+    import argparse
+    import sys
 
-    cols_sql: List[str] = []
-    for col, dtype in zip(df.columns, df.dtypes):
-        sql_type = type_map.get(str(dtype), "TEXT")
-        cols_sql.append(f'"{col}" {sql_type}')
-    cols_clause = ", ".join(cols_sql)
-    return f'CREATE TABLE "{table_name}" ({cols_clause});'
-
-
-# --------------------------------------------------------------------------- #
-# CLI Interface
-# --------------------------------------------------------------------------- #
-
-
-def parse_args(args: Optional[Iterable[str]] = None) -> argparse.Namespace:
-    parser = argparse.ArgumentParser(description="Simple ETL pipeline (CSV → SQLite).")
+    parser = argparse.ArgumentParser(description="Run CSV‑to‑SQLite ETL pipeline.")
+    parser.add_argument("csv_path", help="Path to the source CSV file.")
+    parser.add_argument("db_path", help="Path to the SQLite database file.")
     parser.add_argument(
-        "csv_file",
-        type=Path,
-        help="Absolute path to the source CSV file.",
+        "--required",
+        nargs="+",
+        required=True,
+        help="List of required column names (space‑separated).",
     )
     parser.add_argument(
-        "sqlite_db",
-        type=Path,
-        help="Absolute path to the target SQLite database file.",
+        "--group-by",
+        required=True,
+        help="Column name to group by for aggregation.",
     )
     parser.add_argument(
-        "--table",
-        default="etl_data",
-        help="Destination table name in SQLite (default: etl_data).",
-    )
-    parser.add_argument(
-        "--if-exists",
-        choices=["replace", "append", "fail"],
-        default="replace",
-        help="Behaviour when the destination table already exists (default: replace).",
+        "--agg-field",
+        required=True,
+        help="Numeric column name to aggregate (sum).",
     )
     parser.add_argument(
         "--encoding",
         default="utf-8",
-        help="Encoding of the source CSV file (default: utf-8).",
+        help="File encoding for the CSV input (default: utf-8).",
     )
-    return parser.parse_args(args)
 
+    args = parser.parse_args()
 
-def main() -> None:
-    """Entry point: orchestrates extract → transform → load."""
-    options = parse_args()
     try:
-        raw_df = extract(options.csv_file, encoding=options.encoding)
-        transformed_df = transform(raw_df)
-        if transformed_df.empty:
-            logger.warning("Transformed DataFrame is empty – nothing to load.")
-            return
-        load(
-            transformed_df,
-            db_path=options.sqlite_db,
-            table_name=options.table,
-            if_exists=options.if_exists,
+        run_etl(
+            csv_path=args.csv_path,
+            db_path=args.db_path,
+            required_fields=args.required,
+            group_by=args.group_by,
+            agg_field=args.agg_field,
+            encoding=args.encoding,
         )
-    except ETLException as exc:
-        logger.error("ETL failed: %s", exc)
-        sys.exit(1)
     except KeyboardInterrupt:
-        logger.info("ETL cancelled by user.")
-        sys.exit(130)
-
-
-if __name__ == "__main__":
-    main()
+        logger.warning("ETL pipeline interrupted by user.")
+        sys.exit(1)
+    except Exception as exc:
+        logger.exception("Unhandled exception in ETL pipeline.")
+        sys.exit(1)

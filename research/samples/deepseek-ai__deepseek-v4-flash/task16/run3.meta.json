@@ -1,8 +1,0 @@
-{
-  "model": "deepseek-ai__deepseek-v4-flash",
-  "task": "task16",
-  "run": 3,
-  "model_version": "unknown",
-  "collected_at": "unknown",
-  "source": "nvidia-nim"
-}

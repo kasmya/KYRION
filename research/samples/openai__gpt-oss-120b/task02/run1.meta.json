@@ -1,8 +1,11 @@
 {
-  "model": "openai__gpt-oss-120b",
+  "model": "openai/gpt-oss-120b",
   "task": "task02",
   "run": 1,
-  "model_version": "unknown",
-  "collected_at": "unknown",
-  "source": "nvidia-nim"
+  "collected_at": "2026-07-20",
+  "model_version": "openai/gpt-oss-120b",
+  "temperature": 0.7,
+  "max_tokens": 4096,
+  "truncated": false,
+  "n_lines": 222
 }

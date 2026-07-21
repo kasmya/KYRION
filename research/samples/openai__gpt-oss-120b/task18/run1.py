@@ -1,253 +1,434 @@
 """
-Snippet Manager Flask Application
---------------------------------
+code_snippet_manager.py
 
-Features:
-- Store code snippets with title, description, language, and tags.
-- Search snippets by keyword (title/description/tags) or programming language.
-- Create, edit, delete snippets (CRUD).
-- Display snippets with syntax highlighting using Pygments.
-- Type hints, docstrings, error handling, and security best practices.
+A simple, file‑based code snippet manager supporting creation, retrieval,
+search, editing, deletion, and terminal syntax highlighting.
 
-Dependencies (install via pip):
-    pip install Flask Flask_SQLAlchemy Flask_WTF WTForms Pygments
+Features
+--------
+* Store snippets with title, description, language, tags, and source code.
+* Persistent storage in a JSON file (default: ``snippets.json`` in the user's
+  config directory).
+* Search by keyword (title, description, tags, code) or by programming
+  language.
+* Edit and delete snippets safely.
+* Display snippets with syntax highlighting using Pygments.
+
+Security considerations
+------------------------
+* All file I/O is confined to the dedicated storage directory.
+* Input data is validated and sanitized where appropriate.
+* Exceptions are caught and transformed into domain‑specific errors.
 """
 
 from __future__ import annotations
 
-import os
-import re
-from datetime import datetime
-from typing import List, Optional
+import json
+import uuid
+import datetime
+import pathlib
+import sys
+import threading
+from dataclasses import dataclass, asdict, field
+from typing import List, Dict, Optional, Iterable
 
-from flask import (
-    Flask,
-    abort,
-    flash,
-    redirect,
-    render_template_string,
-    request,
-    url_for,
-)
-from flask_sqlalchemy import SQLAlchemy
-from flask_wtf import FlaskForm, CSRFProtect
-from pygments import highlight
-from pygments.formatters import HtmlFormatter
-from pygments.lexers import get_lexer_by_name, TextLexer
-from wtforms import (
-    HiddenField,
-    SelectField,
-    StringField,
-    SubmitField,
-    TextAreaField,
-)
-from wtforms.validators import DataRequired, Length, Regexp
-
-# --------------------------------------------------------------------------- #
-# Application and Extensions Setup
-# --------------------------------------------------------------------------- #
-
-BASE_DIR = os.path.abspath(os.path.dirname(__file__))
-DATABASE_PATH = os.path.join(BASE_DIR, "snippets.db")
-
-app = Flask(__name__)
-app.config["SECRET_KEY"] = os.urandom(24)  # Use a strong random secret key
-app.config["SQLALCHEMY_DATABASE_URI"] = f"sqlite:///{DATABASE_PATH}"
-app.config["SQLALCHEMY_TRACK_MODIFICATIONS"] = False
-
-db = SQLAlchemy(app)
-csrf = CSRFProtect(app)
-
-# --------------------------------------------------------------------------- #
-# Database Model
-# --------------------------------------------------------------------------- #
-
-
-class Snippet(db.Model):
-    """SQLAlchemy model representing a code snippet."""
-
-    __tablename__ = "snippets"
-
-    id = db.Column(db.Integer, primary_key=True)
-    title = db.Column(db.String(120), nullable=False, unique=True)
-    description = db.Column(db.String(500), nullable=True)
-    code = db.Column(db.Text, nullable=False)
-    language = db.Column(db.String(30), nullable=False)
-    tags = db.Column(db.String(250), nullable=True)  # comma‑separated tags
-    created_at = db.Column(
-        db.DateTime, nullable=False, default=datetime.utcnow
-    )
-    updated_at = db.Column(
-        db.DateTime,
-        nullable=False,
-        default=datetime.utcnow,
-        onupdate=datetime.utcnow,
-    )
-
-    @property
-    def tag_list(self) -> List[str]:
-        """Return tags as a cleaned list of strings."""
-        if not self.tags:
-            return []
-        return [t.strip() for t in self.tags.split(",") if t.strip()]
-
-    def __repr__(self) -> str:
-        return f"<Snippet {self.id} – {self.title!r}>"
+# Third‑party dependency – widely used and pure Python
+try:
+    from pygments import highlight
+    from pygments.lexers import get_lexer_by_name, guess_lexer
+    from pygments.formatters import TerminalFormatter
+except ImportError as exc:  # pragma: no cover
+    raise ImportError(
+        "Pygments is required for syntax highlighting. Install it via "
+        "`pip install pygments`."
+    ) from exc
 
 
 # --------------------------------------------------------------------------- #
-# Forms
+# Exceptions
 # --------------------------------------------------------------------------- #
 
+class SnippetError(Exception):
+    """Base class for all snippet manager errors."""
 
-def _validate_tags(form, field):
-    """Validate that tags are a comma‑separated list of word characters."""
-    if not field.data:
-        return
-    for tag in field.data.split(","):
-        tag = tag.strip()
-        if not re.fullmatch(r"\w+", tag):
-            raise ValueError(
-                f"Invalid tag '{tag}'. Tags must contain only letters, digits, or underscore."
+
+class SnippetNotFoundError(SnippetError):
+    """Raised when a snippet with a given identifier cannot be found."""
+
+
+class SnippetStorageError(SnippetError):
+    """Raised for I/O or serialization problems."""
+
+
+# --------------------------------------------------------------------------- #
+# Data model
+# --------------------------------------------------------------------------- #
+
+@dataclass
+class Snippet:
+    """Represent a single code snippet."""
+
+    id: str
+    title: str
+    description: str
+    language: str
+    tags: List[str]
+    code: str
+    created_at: str = field(default_factory=lambda: datetime.datetime.utcnow().isoformat())
+    updated_at: str = field(default_factory=lambda: datetime.datetime.utcnow().isoformat())
+
+    @staticmethod
+    def from_dict(data: Dict[str, object]) -> "Snippet":
+        """Create a Snippet instance from a raw dictionary."""
+        required = {"id", "title", "description", "language", "tags", "code", "created_at", "updated_at"}
+        missing = required - data.keys()
+        if missing:
+            raise SnippetStorageError(f"Missing fields in snippet data: {missing}")
+        return Snippet(
+            id=str(data["id"]),
+            title=str(data["title"]),
+            description=str(data["description"]),
+            language=str(data["language"]),
+            tags=list(map(str, data["tags"])),
+            code=str(data["code"]),
+            created_at=str(data["created_at"]),
+            updated_at=str(data["updated_at"]),
+        )
+
+    def to_dict(self) -> Dict[str, object]:
+        """Serialise the snippet to a plain dictionary."""
+        return asdict(self)
+
+
+# --------------------------------------------------------------------------- #
+# Manager
+# --------------------------------------------------------------------------- #
+
+class SnippetManager:
+    """
+    Manage a collection of Snippet objects persisted to a JSON file.
+
+    The manager is thread‑safe for concurrent read/write operations.
+    """
+
+    def __init__(self, storage_path: Optional[pathlib.Path] = None) -> None:
+        """
+        Initialise the manager.
+
+        Parameters
+        ----------
+        storage_path:
+            Path to the JSON file used for persistence. If omitted,
+            ``~/.config/snippet_manager/snippets.json`` is used.
+        """
+        self._lock = threading.RLock()
+        self.storage_path = storage_path or pathlib.Path.home() / ".config" / "snippet_manager" / "snippets.json"
+        self.storage_path.parent.mkdir(parents=True, exist_ok=True)
+        self._snippets: Dict[str, Snippet] = {}
+        self._load()
+
+    # ------------------------------------------------------------------- #
+    # Persistence helpers
+    # ------------------------------------------------------------------- #
+
+    def _load(self) -> None:
+        """Load snippets from the JSON storage file."""
+        with self._lock:
+            if not self.storage_path.is_file():
+                self._snippets = {}
+                return
+            try:
+                raw = json.loads(self.storage_path.read_text(encoding="utf-8"))
+                self._snippets = {
+                    str(item["id"]): Snippet.from_dict(item) for item in raw
+                }
+            except (json.JSONDecodeError, OSError) as exc:
+                raise SnippetStorageError(f"Failed to read storage file: {exc}") from exc
+
+    def _save(self) -> None:
+        """Write the current snippet collection to the JSON storage file."""
+        with self._lock:
+            try:
+                serialisable = [snip.to_dict() for snip in self._snippets.values()]
+                self.storage_path.write_text(json.dumps(serialisable, indent=2, sort_keys=True), encoding="utf-8")
+            except OSError as exc:
+                raise SnippetStorageError(f"Failed to write storage file: {exc}") from exc
+
+    # ------------------------------------------------------------------- #
+    # CRUD operations
+    # ------------------------------------------------------------------- #
+
+    def add_snippet(
+        self,
+        title: str,
+        description: str,
+        language: str,
+        tags: Iterable[str],
+        code: str,
+    ) -> Snippet:
+        """
+        Create and store a new snippet.
+
+        Parameters
+        ----------
+        title:
+            Human‑readable title.
+        description:
+            Detailed description.
+        language:
+            Programming language identifier (e.g., ``python``, ``javascript``).
+        tags:
+            Iterable of tag strings.
+        code:
+            The source code.
+
+        Returns
+        -------
+        Snippet:
+            The newly created snippet instance.
+        """
+        if not title.strip():
+            raise ValueError("Title must not be empty.")
+        if not language.strip():
+            raise ValueError("Language must not be empty.")
+        snippet_id = str(uuid.uuid4())
+        snippet = Snippet(
+            id=snippet_id,
+            title=title.strip(),
+            description=description.strip(),
+            language=language.strip().lower(),
+            tags=[t.strip().lower() for t in tags if t.strip()],
+            code=code,
+        )
+        with self._lock:
+            self._snippets[snippet_id] = snippet
+            self._save()
+        return snippet
+
+    def get_snippet(self, snippet_id: str) -> Snippet:
+        """
+        Retrieve a snippet by its identifier.
+
+        Parameters
+        ----------
+        snippet_id:
+            UUID string of the snippet.
+
+        Returns
+        -------
+        Snippet:
+            The requested snippet.
+
+        Raises
+        ------
+        SnippetNotFoundError:
+            If no snippet matches the given identifier.
+        """
+        with self._lock:
+            try:
+                return self._snippets[snippet_id]
+            except KeyError as exc:
+                raise SnippetNotFoundError(f"Snippet {snippet_id} not found.") from exc
+
+    def edit_snippet(
+        self,
+        snippet_id: str,
+        *,
+        title: Optional[str] = None,
+        description: Optional[str] = None,
+        language: Optional[str] = None,
+        tags: Optional[Iterable[str]] = None,
+        code: Optional[str] = None,
+    ) -> Snippet:
+        """
+        Update fields of an existing snippet.
+
+        Parameters
+        ----------
+        snippet_id:
+            Identifier of the snippet to edit.
+        title, description, language, tags, code:
+            Optional new values. ``None`` leaves the field unchanged.
+
+        Returns
+        -------
+        Snippet:
+            The updated snippet.
+
+        Raises
+        ------
+        SnippetNotFoundError:
+            If the snippet does not exist.
+        """
+        with self._lock:
+            snippet = self.get_snippet(snippet_id)
+            if title is not None:
+                if not title.strip():
+                    raise ValueError("Title must not be empty.")
+                snippet.title = title.strip()
+            if description is not None:
+                snippet.description = description.strip()
+            if language is not None:
+                if not language.strip():
+                    raise ValueError("Language must not be empty.")
+                snippet.language = language.strip().lower()
+            if tags is not None:
+                snippet.tags = [t.strip().lower() for t in tags if t.strip()]
+            if code is not None:
+                snippet.code = code
+            snippet.updated_at = datetime.datetime.utcnow().isoformat()
+            self._snippets[snippet_id] = snippet
+            self._save()
+            return snippet
+
+    def delete_snippet(self, snippet_id: str) -> None:
+        """
+        Remove a snippet from storage.
+
+        Parameters
+        ----------
+        snippet_id:
+            Identifier of the snippet to delete.
+
+        Raises
+        ------
+        SnippetNotFoundError:
+            If the snippet does not exist.
+        """
+        with self._lock:
+            if snippet_id not in self._snippets:
+                raise SnippetNotFoundError(f"Snippet {snippet_id} not found.")
+            del self._snippets[snippet_id]
+            self._save()
+
+    # ------------------------------------------------------------------- #
+    # Query utilities
+    # ------------------------------------------------------------------- #
+
+    def search(
+        self,
+        keyword: Optional[str] = None,
+        language: Optional[str] = None,
+    ) -> List[Snippet]:
+        """
+        Search snippets by keyword and/or language.
+
+        Parameters
+        ----------
+        keyword:
+            Case‑insensitive substring to look for in title, description,
+            tags, or code.
+        language:
+            Exact language match (case‑insensitive).
+
+        Returns
+        -------
+        List[Snippet]:
+            All snippets satisfying the criteria.
+        """
+        keyword_lc = (keyword or "").lower()
+        language_lc = (language or "").lower()
+        results: List[Snippet] = []
+
+        with self._lock:
+            for snip in self._snippets.values():
+                if language_lc and snip.language != language_lc:
+                    continue
+                if keyword_lc:
+                    in_fields = (
+                        keyword_lc in snip.title.lower()
+                        or keyword_lc in snip.description.lower()
+                        or any(keyword_lc in tag for tag in snip.tags)
+                        or keyword_lc in snip.code.lower()
+                    )
+                    if not in_fields:
+                        continue
+                results.append(snip)
+        return results
+
+    def list_snippets(self) -> List[Snippet]:
+        """
+        Return all stored snippets sorted by creation date.
+
+        Returns
+        -------
+        List[Snippet]:
+            All snippets.
+        """
+        with self._lock:
+            return sorted(
+                self._snippets.values(),
+                key=lambda s: s.created_at,
             )
 
+    # ------------------------------------------------------------------- #
+    # Display helpers
+    # ------------------------------------------------------------------- #
 
-class SnippetForm(FlaskForm):
-    """Form for creating or editing a snippet."""
+    def display_snippet(self, snippet_id: str, stream: Optional[object] = None) -> None:
+        """
+        Print a snippet with syntax highlighting to the given stream.
 
-    title = StringField(
-        "Title",
-        validators=[
-            DataRequired(),
-            Length(max=120, message="Title must be at most 120 characters."),
-        ],
-    )
-    description = StringField(
-        "Description",
-        validators=[Length(max=500, message="Description must be at most 500 characters.")],
-    )
-    language = SelectField(
-        "Language",
-        choices=[
-            ("python", "Python"),
-            ("javascript", "JavaScript"),
-            ("java", "Java"),
-            ("c", "C"),
-            ("cpp", "C++"),
-            ("go", "Go"),
-            ("ruby", "Ruby"),
-            ("bash", "Bash"),
-            ("html", "HTML"),
-            ("css", "CSS"),
-            ("sql", "SQL"),
-            ("text", "Plain Text"),
-        ],
-        validators=[DataRequired()],
-    )
-    tags = StringField(
-        "Tags (comma separated)",
-        validators=[_validate_tags],
-        description="Enter tags separated by commas. Only letters, digits, and underscores are allowed.",
-    )
-    code = TextAreaField(
-        "Code",
-        validators=[
-            DataRequired(),
-            Length(min=1, message="Code cannot be empty."),
-        ],
-    )
-    snippet_id = HiddenField()  # used for editing
-    submit = SubmitField("Save")
+        Parameters
+        ----------
+        snippet_id:
+            Identifier of the snippet to display.
+        stream:
+            Text stream to write to. Defaults to ``sys.stdout``.
+        """
+        stream = stream or sys.stdout
+        snippet = self.get_snippet(snippet_id)
 
-
-# --------------------------------------------------------------------------- #
-# Helper Functions
-# --------------------------------------------------------------------------- #
-
-
-def highlight_code(code: str, language: str) -> str:
-    """
-    Return HTML with syntax‑highlighted code using Pygments.
-
-    Args:
-        code: Raw source code.
-        language: Language identifier accepted by Pygments.
-
-    Returns:
-        HTML string with highlighted code.
-    """
-    try:
-        lexer = get_lexer_by_name(language, stripall=True)
-    except Exception:
-        lexer = TextLexer(stripall=True)
-    formatter = HtmlFormatter(linenos=True, cssclass="codehilite")
-    return highlight(code, lexer, formatter)
-
-
-def init_db() -> None:
-    """Initialize the SQLite database if it does not exist."""
-    if not os.path.exists(DATABASE_PATH):
-        db.create_all()
-        # Optionally, add a few sample snippets
-        sample = Snippet(
-            title="Hello World in Python",
-            description="Simple hello world example.",
-            code='print("Hello, World!")',
-            language="python",
-            tags="example,hello",
+        # Header
+        header = (
+            f"Title      : {snippet.title}\n"
+            f"Description: {snippet.description}\n"
+            f"Language   : {snippet.language}\n"
+            f"Tags       : {', '.join(snippet.tags)}\n"
+            f"Created    : {snippet.created_at}\n"
+            f"Updated    : {snippet.updated_at}\n"
+            f"{'-' * 40}\n"
         )
-        db.session.add(sample)
-        db.session.commit()
+        print(header, file=stream)
+
+        # Syntax highlighted code
+        lexer = self._choose_lexer(snippet.language, snippet.code)
+        highlighted = highlight(snippet.code, lexer, TerminalFormatter())
+        print(highlighted, file=stream)
+
+    @staticmethod
+    def _choose_lexer(language: str, code: str):
+        """
+        Resolve a Pygments lexer for the given language, falling back to guessing.
+
+        Parameters
+        ----------
+        language:
+            Language identifier supplied by the user.
+        code:
+            Source code (used as fallback for guessing).
+
+        Returns
+        -------
+        Lexer:
+            Pygments lexer instance.
+        """
+        try:
+            return get_lexer_by_name(language)
+        except Exception:
+            # If the explicit name fails, let Pygments guess.
+            try:
+                return guess_lexer(code)
+            except Exception:
+                # Fallback to plain text lexer.
+                from pygments.lexers import TextLexer
+                return TextLexer()
 
 
-# --------------------------------------------------------------------------- #
-# Routes
-# --------------------------------------------------------------------------- #
-
-
-@app.route("/", methods=["GET"])
-def index() -> str:
-    """
-    Home page – list snippets with optional search filters.
-    """
-    keyword = request.args.get("q", "").strip()
-    language = request.args.get("lang", "").strip()
-
-    query = Snippet.query
-    if keyword:
-        like_pattern = f"%{keyword}%"
-        query = query.filter(
-            db.or_(
-                Snippet.title.ilike(like_pattern),
-                Snippet.description.ilike(like_pattern),
-                Snippet.tags.ilike(like_pattern),
-            )
-        )
-    if language:
-        query = query.filter(Snippet.language == language)
-
-    snippets = query.order_by(Snippet.updated_at.desc()).all()
-
-    template = """
-    <!doctype html>
-    <title>Snippet Manager</title>
-    <link rel="stylesheet" href="{{ url_for('static', filename='style.css') }}">
-    <h1>Snippet Manager</h1>
-
-    <form method="get" action="{{ url_for('index') }}">
-        <input type="text" name="q" placeholder="Search..." value="{{ request.args.get('q','') }}">
-        <select name="lang">
-            <option value="">All Languages</option>
-            {% for code, name in language_choices %}
-            <option value="{{ code }}" {% if request.args.get('lang') == code %}selected{% endif %}>{{ name }}</option>
-            {% endfor %}
-        </select>
-        <button type="submit">Search</button>
-        <a href="{{ url_for('create') }}">Create New Snippet</a>
-    </form>
-
-    {% for snippet in snippets %}
-        <div class="snippet-summary">
-            <h2><a href="{{ url_for('view_snippet', snippet_id=snippet.id) }}">{{ snippet.title }}</a></h2>
-            <p>{{ snippet.description or '' }}</p>
-            <p><strong>Language:</strong> {{ snippet.language }} | <strong>Tags:</strong> {{
+__all__ = [
+    "Snippet",
+    "SnippetManager",
+    "SnippetError",
+    "SnippetNotFoundError",
+    "SnippetStorageError",
+]

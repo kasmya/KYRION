@@ -1,216 +1,182 @@
 """
 task_scheduler.py
 
-A lightweight, persistent, and extensible task scheduler built on APScheduler.
-Features:
-- Add / remove / list scheduled jobs
-- Persistent storage via SQLite (SQLAlchemyJobStore)
-- Execution logging to file and console
-- Supports daily, hourly, minute-level schedules
-- Type hints, extensive docstrings, and robust error handling
+A lightweight, persistent task scheduler supporting daily, hourly, and minute
+frequencies. Jobs can be added, removed, and listed. Executions are logged with
+success/failure details. Persistence is achieved via an SQLite job store.
+
+Only the Python standard library and the widely‑used ``APScheduler`` package are
+required.
 """
 
 from __future__ import annotations
 
+import importlib
 import logging
-import os
 import sys
 from datetime import datetime
 from pathlib import Path
-from typing import Any, Callable, Dict, List, Optional, Union
+from typing import Any, Callable, Mapping, MutableMapping, Sequence
 
 from apscheduler.events import EVENT_JOB_ERROR, EVENT_JOB_EXECUTED, JobExecutionEvent
 from apscheduler.job import Job
 from apscheduler.jobstores.sqlalchemy import SQLAlchemyJobStore
 from apscheduler.schedulers.background import BackgroundScheduler
 from apscheduler.triggers.cron import CronTrigger
-from apscheduler.triggers.interval import IntervalTrigger
 
 # --------------------------------------------------------------------------- #
 # Logging configuration
 # --------------------------------------------------------------------------- #
-LOG_DIR = Path(os.getenv("TASK_SCHEDULER_LOG_DIR", ".")) / "logs"
-LOG_DIR.mkdir(parents=True, exist_ok=True)
-
-LOGGER = logging.getLogger("TaskScheduler")
+LOG_FILE = Path(__file__).with_name("task_scheduler.log")
+LOGGER = logging.getLogger("task_scheduler")
 LOGGER.setLevel(logging.INFO)
-formatter = logging.Formatter(
-    "%(asctime)s | %(levelname)-8s | %(name)s | %(message)s", "%Y-%m-%d %H:%M:%S"
+_formatter = logging.Formatter(
+    "%(asctime)s - %(levelname)s - %(name)s - %(message)s"
 )
-
-# file handler
-file_handler = logging.FileHandler(LOG_DIR / "scheduler.log")
-file_handler.setFormatter(formatter)
-LOGGER.addHandler(file_handler)
-
-# console handler
-console_handler = logging.StreamHandler(sys.stdout)
-console_handler.setFormatter(formatter)
-LOGGER.addHandler(console_handler)
+_handler = logging.handlers.RotatingFileHandler(
+    LOG_FILE, maxBytes=5 * 1024 * 1024, backupCount=3, encoding="utf-8"
+)
+_handler.setFormatter(_formatter)
+LOGGER.addHandler(_handler)
 
 
 # --------------------------------------------------------------------------- #
-# Custom Exceptions
+# Exceptions
 # --------------------------------------------------------------------------- #
 class SchedulerError(Exception):
-    """Base exception for scheduler related errors."""
-
-
-class JobAlreadyExistsError(SchedulerError):
-    """Raised when trying to add a job with a duplicate identifier."""
+    """Base exception for scheduler‑related errors."""
 
 
 class JobNotFoundError(SchedulerError):
-    """Raised when trying to manipulate a non‑existent job."""
+    """Raised when a job with the requested identifier does not exist."""
+
+
+class InvalidFrequencyError(SchedulerError):
+    """Raised when an unsupported frequency string is supplied."""
+
+
+class FunctionImportError(SchedulerError):
+    """Raised when a job function cannot be imported safely."""
 
 
 # --------------------------------------------------------------------------- #
-# Helper Types
-# --------------------------------------------------------------------------- #
-TriggerArgs = Dict[str, Union[int, str, datetime]]
-
-
-# --------------------------------------------------------------------------- #
-# Core Scheduler Implementation
+# Scheduler implementation
 # --------------------------------------------------------------------------- #
 class TaskScheduler:
     """
-    Wrapper around APScheduler providing a simple API for adding, removing,
-    and persisting scheduled tasks.
+    Persistent task scheduler using APScheduler.
 
-    Parameters
-    ----------
-    db_path : str, optional
-        Filesystem path to the SQLite database used for job persistence.
-        If omitted, a file named ``tasks.sqlite`` is created in the current
-        working directory.
+    Jobs are stored in an SQLite database (default ``tasks.sqlite``) and survive
+    process restarts. Supported frequencies are ``daily``, ``hourly`` and
+    ``minute``.
     """
 
-    def __init__(self, db_path: Optional[str] = None) -> None:
-        sqlite_path = db_path or str(Path.cwd() / "tasks.sqlite")
-        self._jobstore = {"default": SQLAlchemyJobStore(url=f"sqlite:///{sqlite_path}")}
+    _SUPPORTED_FREQUENCIES = {"daily", "hourly", "minute"}
 
-        self._scheduler = BackgroundScheduler(jobstores=self._jobstore)
-        self._scheduler.add_listener(self._job_listener, EVENT_JOB_EXECUTED | EVENT_JOB_ERROR)
-        self._scheduler.start()
-        LOGGER.info("TaskScheduler initialized with jobstore at %s", sqlite_path)
+    def __init__(self, db_url: str = "sqlite:///tasks.sqlite") -> None:
+        """
+        Initialise the scheduler with a persistent job store.
+
+        Args:
+            db_url: SQLAlchemy URL for the job store (defaults to a local SQLite file).
+
+        Raises:
+            SchedulerError: If the APScheduler cannot be instantiated.
+        """
+        try:
+            jobstores = {"default": SQLAlchemyJobStore(url=db_url)}
+            self._scheduler = BackgroundScheduler(jobstores=jobstores)
+            self._scheduler.add_listener(self._job_listener, EVENT_JOB_EXECUTED | EVENT_JOB_ERROR)
+            self._scheduler.start()
+            LOGGER.info("TaskScheduler started with DB %s", db_url)
+        except Exception as exc:
+            LOGGER.exception("Failed to start scheduler")
+            raise SchedulerError("Failed to initialise the scheduler") from exc
 
     # ------------------------------------------------------------------- #
     # Public API
     # ------------------------------------------------------------------- #
-    def add_task(
+    def add_job(
         self,
-        job_id: str,
-        func: Callable[..., Any],
-        trigger: str,
-        trigger_args: Optional[TriggerArgs] = None,
-        args: Optional[List[Any]] = None,
-        kwargs: Optional[Dict[str, Any]] = None,
-        replace_existing: bool = False,
-    ) -> Job:
+        name: str,
+        func_path: str,
+        frequency: str,
+        start_time: datetime | None = None,
+        args: Sequence[Any] | None = None,
+        kwargs: Mapping[str, Any] | None = None,
+    ) -> None:
         """
-        Schedule a new job.
+        Register a new job.
 
-        Parameters
-        ----------
-        job_id : str
-            Unique identifier for the job.
-        func : Callable[..., Any]
-            Callable to be executed. Must be importable (no lambdas/closures).
-        trigger : str
-            One of ``'cron'`` or ``'interval'``.
-        trigger_args : dict, optional
-            Arguments passed to the underlying APScheduler trigger.
-            For ``cron`` you may provide ``hour``, ``minute``, ``day`` etc.
-            For ``interval`` you may provide ``seconds``, ``minutes``, ``hours``.
-        args : list, optional
-            Positional arguments for ``func``.
-        kwargs : dict, optional
-            Keyword arguments for ``func``.
-        replace_existing : bool, default False
-            If ``True`` and a job with ``job_id`` exists, it will be replaced.
+        The target function is identified by ``func_path`` (e.g.
+        ``"my_module.my_function"``). The function must be importable and callable.
 
-        Returns
-        -------
-        apscheduler.job.Job
-            The created APScheduler job instance.
+        Args:
+            name: Unique identifier for the job.
+            func_path: Dotted path to the callable to execute.
+            frequency: One of ``"daily"``, ``"hourly"``, or ``"minute"``.
+            start_time: Optional earliest run time; defaults to now.
+            args: Positional arguments for the job function.
+            kwargs: Keyword arguments for the job function.
 
-        Raises
-        ------
-        JobAlreadyExistsError
-            If a job with the given ``job_id`` already exists and
-            ``replace_existing`` is ``False``.
-        SchedulerError
-            For any other scheduling failure.
+        Raises:
+            InvalidFrequencyError: If ``frequency`` is not supported.
+            FunctionImportError: If the target function cannot be imported.
+            SchedulerError: For any APScheduler‑related failure.
         """
-        if not callable(func):
-            raise SchedulerError("Provided func must be callable.")
+        if frequency not in self._SUPPORTED_FREQUENCIES:
+            raise InvalidFrequencyError(f"Unsupported frequency: {frequency}")
 
-        if job_id in self._scheduler.get_jobs():
-            if not replace_existing:
-                raise JobAlreadyExistsError(f"Job with id '{job_id}' already exists.")
-            self.remove_task(job_id)
+        func = self._load_callable(func_path)
 
-        trigger_args = trigger_args or {}
-        logger = LOGGER
+        trigger = self._build_trigger(frequency, start_time)
 
         try:
-            if trigger == "cron":
-                trigger_obj = CronTrigger(**trigger_args)  # type: ignore[arg-type]
-            elif trigger == "interval":
-                trigger_obj = IntervalTrigger(**trigger_args)  # type: ignore[arg-type]
-            else:
-                raise SchedulerError("Unsupported trigger type. Use 'cron' or 'interval'.")
-
-            job = self._scheduler.add_job(
+            self._scheduler.add_job(
                 func,
-                trigger=trigger_obj,
-                id=job_id,
+                trigger,
+                id=name,
+                name=name,
                 args=args or [],
-                kwargs=kwargs or {},
-                replace_existing=replace_existing,
+                kwargs=dict(kwargs) if kwargs else {},
+                replace_existing=False,
                 misfire_grace_time=60,
                 coalesce=True,
-                max_instances=1,
-                name=func.__name__,
             )
-            logger.info("Added job '%s' with trigger %s", job_id, trigger)
-            return job
+            LOGGER.info("Added job %s with frequency %s", name, frequency)
         except Exception as exc:
-            logger.exception("Failed to add job '%s': %s", job_id, exc)
-            raise SchedulerError(f"Failed to add job '{job_id}': {exc}") from exc
+            LOGGER.exception("Failed to add job %s", name)
+            raise SchedulerError(f"Could not add job '{name}'") from exc
 
-    def remove_task(self, job_id: str) -> None:
+    def remove_job(self, name: str) -> None:
         """
         Remove a scheduled job.
 
-        Parameters
-        ----------
-        job_id : str
-            Identifier of the job to remove.
+        Args:
+            name: Identifier of the job to delete.
 
-        Raises
-        ------
-        JobNotFoundError
-            If the job does not exist.
+        Raises:
+            JobNotFoundError: If the job does not exist.
+            SchedulerError: For any APScheduler‑related failure.
         """
         try:
-            self._scheduler.remove_job(job_id)
-            LOGGER.info("Removed job '%s'", job_id)
+            self._scheduler.remove_job(job_id=name)
+            LOGGER.info("Removed job %s", name)
         except Exception as exc:
-            LOGGER.exception("Error removing job '%s': %s", job_id, exc)
-            raise JobNotFoundError(f"Job '{job_id}' not found.") from exc
+            if "JobLookupError" in str(exc):
+                raise JobNotFoundError(f"Job '{name}' not found") from exc
+            LOGGER.exception("Failed to remove job %s", name)
+            raise SchedulerError(f"Could not remove job '{name}'") from exc
 
-    def list_tasks(self) -> List[Dict[str, Any]]:
+    def list_jobs(self) -> list[dict[str, Any]]:
         """
-        Retrieve a summary of all scheduled jobs.
+        Return a list of all scheduled jobs with basic metadata.
 
-        Returns
-        -------
-        list of dict
-            Each dict contains ``id``, ``name``, ``next_run_time`` and ``trigger``.
+        Returns:
+            A list of dictionaries, each containing ``id``, ``name``,
+            ``next_run_time`` and ``trigger`` description.
         """
-        jobs_info = []
+        jobs_info: list[dict[str, Any]] = []
         for job in self._scheduler.get_jobs():
             jobs_info.append(
                 {
@@ -224,44 +190,106 @@ class TaskScheduler:
 
     def shutdown(self, wait: bool = True) -> None:
         """
-        Gracefully shutdown the scheduler.
+        Gracefully shut down the scheduler.
 
-        Parameters
-        ----------
-        wait : bool, default True
-            Wait for all running jobs to finish before shutting down.
+        Args:
+            wait: If ``True``, block until all running jobs finish.
         """
-        LOGGER.info("Shutting down TaskScheduler...")
         self._scheduler.shutdown(wait=wait)
-        LOGGER.info("TaskScheduler stopped.")
+        LOGGER.info("TaskScheduler shutdown (wait=%s)", wait)
 
     # ------------------------------------------------------------------- #
-    # Private helpers
+    # Internal helpers
     # ------------------------------------------------------------------- #
+    @staticmethod
+    def _load_callable(func_path: str) -> Callable[..., Any]:
+        """
+        Safely import a callable given its dotted path.
+
+        Args:
+            func_path: Dotted module path to the callable.
+
+        Returns:
+            The imported callable.
+
+        Raises:
+            FunctionImportError: If the import fails or the object is not callable.
+        """
+        try:
+            module_path, attr_name = func_path.rsplit(".", 1)
+            module = importlib.import_module(module_path)
+            func = getattr(module, attr_name)
+            if not callable(func):
+                raise TypeError(f"Object '{func_path}' is not callable")
+            return func
+        except Exception as exc:
+            LOGGER.exception("Failed to import function %s", func_path)
+            raise FunctionImportError(f"Cannot import callable '{func_path}'") from exc
+
+    @staticmethod
+    def _build_trigger(
+        frequency: str, start_time: datetime | None
+    ) -> CronTrigger:
+        """
+        Build an APScheduler ``CronTrigger`` based on the requested frequency.
+
+        Args:
+            frequency: ``"daily"``, ``"hourly"``, or ``"minute"``.
+            start_time: Optional earliest run time.
+
+        Returns:
+            Configured ``CronTrigger`` instance.
+        """
+        if frequency == "daily":
+            return CronTrigger(hour=0, minute=0, start_date=start_time)
+        if frequency == "hourly":
+            return CronTrigger(minute=0, start_date=start_time)
+        # frequency == "minute"
+        return CronTrigger(second=0, start_date=start_time)
+
     @staticmethod
     def _job_listener(event: JobExecutionEvent) -> None:
         """
-        APScheduler listener that logs job execution results.
+        Listener that logs job execution outcomes.
+
+        Args:
+            event: APScheduler job execution event.
         """
-        job_id = event.job_id
         if event.exception:
             LOGGER.error(
-                "Job '%s' failed with exception: %s", job_id, event.exception, exc_info=event.exception
+                "Job %s failed with exception: %s",
+                event.job_id,
+                event.exception,
+                exc_info=event.exception,
             )
         else:
-            LOGGER.info("Job '%s' executed successfully.", job_id)
+            LOGGER.info("Job %s executed successfully", event.job_id)
 
 
 # --------------------------------------------------------------------------- #
 # Example usage (executed only when run as a script)
 # --------------------------------------------------------------------------- #
 if __name__ == "__main__":
+    # Simple demonstration functions
+    def hello(name: str = "world") -> None:
+        print(f"Hello, {name}! Current time: {datetime.now()}")
 
-    def sample_task(message: str, *, repeat: int = 1) -> None:
-        """A simple demonstration task."""
-        for i in range(repeat):
-            LOGGER.info("Task says: %s (iteration %d)", message, i + 1)
+    # Register demo function in the current module for import by dotted path
+    current_module = sys.modules[__name__]
+    setattr(current_module, "hello", hello)
 
     scheduler = TaskScheduler()
-
-    # Add a minute‑level interval job (runs every 2 minutes
+    try:
+        scheduler.add_job(
+            name="greeting",
+            func_path=f"{__name__}.hello",
+            frequency="minute",
+            args=["APScheduler"],
+        )
+        print("Scheduler is running. Press Ctrl+C to exit.")
+        while True:
+            pass  # Keep the main thread alive
+    except KeyboardInterrupt:
+        print("\nShutting down...")
+    finally:
+        scheduler.shutdown()

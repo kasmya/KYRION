@@ -1,255 +1,347 @@
-#!/usr/bin/env python3
-"""
-Email Automation Bot
+"""email_automation_bot.py
 
-Features:
-- Load recipient list from a CSV file.
-- Render a plain‑text email template with placeholders (e.g. {{name}}).
-- Send personalised emails via SMTP with TLS.
-- Log each sent email (including failures) to a rotating file logger.
+A lightweight email automation utility that reads recipient data from a CSV file,
+renders a templated email using placeholders, sends the email via SMTP with TLS,
+and logs each successful send. Designed with type hints, comprehensive docstrings,
+and robust error handling while adhering to security best practices.
 
-Only the Python standard library is used.
+Dependencies:
+- Python 3.8+
+- Standard library only (no external packages required)
+
+Usage example:
+    from email_automation_bot import SMTPConfig, send_bulk_emails
+
+    config = SMTPConfig(
+        host="smtp.example.com",
+        port=587,
+        username="user@example.com",
+        password=os.getenv("SMTP_PASSWORD"),
+        use_tls=True,
+    )
+    send_bulk_emails(
+        csv_path="recipients.csv",
+        template_path="email_template.txt",
+        smtp_config=config,
+        sender="user@example.com",
+        subject="Welcome, {{ name }}!",
+    )
 """
+
+from __future__ import annotations
 
 import csv
 import logging
 import os
 import smtplib
 import ssl
-import sys
-from argparse import ArgumentParser
 from dataclasses import dataclass
 from email.message import EmailMessage
+from pathlib import Path
 from string import Template
-from typing import Dict, List, Mapping, NamedTuple, Optional
+from typing import Any, Dict, List
 
 # --------------------------------------------------------------------------- #
 # Logging configuration
 # --------------------------------------------------------------------------- #
-LOG_FORMAT = "%(asctime)s %(levelname)-8s %(name)s %(message)s"
-logging.basicConfig(
-    level=logging.INFO,
-    format=LOG_FORMAT,
-    handlers=[
-        logging.FileHandler("email_bot.log", encoding="utf-8"),
-        logging.StreamHandler(sys.stdout),
-    ],
-)
-logger = logging.getLogger("email_bot")
+LOGGER = logging.getLogger(__name__)
+if not LOGGER.handlers:
+    handler = logging.StreamHandler()
+    formatter = logging.Formatter(
+        fmt="%(asctime)s - %(levelname)s - %(message)s",
+        datefmt="%Y-%m-%d %H:%M:%S",
+    )
+    handler.setFormatter(formatter)
+    LOGGER.addHandler(handler)
+    LOGGER.setLevel(logging.INFO)
 
 
 # --------------------------------------------------------------------------- #
 # Data structures
 # --------------------------------------------------------------------------- #
-@dataclass(frozen=True)
+@dataclass(frozen=True, slots=True)
 class SMTPConfig:
-    """Configuration required to connect to an SMTP server."""
+    """Configuration required to connect to an SMTP server.
+
+    Attributes:
+        host: SMTP server hostname or IP address.
+        port: Port number (usually 587 for STARTTLS or 465 for SSL).
+        username: Account username (often the email address).
+        password: Account password. Should be provided via environment variable
+                  or a secure secret manager; never hard‑coded.
+        use_tls: If True, initiate a STARTTLS session after connecting.
+    """
 
     host: str
     port: int
     username: str
     password: str
     use_tls: bool = True
-    timeout: Optional[int] = 30
-
-
-class Recipient(NamedTuple):
-    """Immutable representation of a CSV row containing at least an email."""
-
-    email: str
-    name: str
-    # Additional fields can be accessed via the underlying mapping
-    extra: Mapping[str, str] = {}
 
 
 # --------------------------------------------------------------------------- #
 # Core functionality
 # --------------------------------------------------------------------------- #
-def load_recipients(csv_path: str) -> List[Recipient]:
-    """
-    Load recipients from a CSV file.
+def load_recipients(csv_path: str | Path) -> List[Dict[str, str]]:
+    """Load recipient data from a CSV file.
 
-    The CSV must contain a column named ``email``.  Any other columns are
-    considered placeholders for the template (e.g. ``name``).
+    The CSV must contain a header row. Each row becomes a dictionary mapping
+    column names to values.
 
     Args:
-        csv_path: Path to the CSV file.
+        csv_path: Path to the CSV file containing recipient information.
 
     Returns:
-        List of :class:`Recipient` objects.
+        A list of dictionaries, each representing a recipient.
 
     Raises:
         FileNotFoundError: If the CSV file does not exist.
-        ValueError: If the required ``email`` column is missing.
+        PermissionError: If the file cannot be read due to insufficient permissions.
+        csv.Error: For malformed CSV content.
     """
-    recipients: List[Recipient] = []
-    with open(csv_path, newline="", encoding="utf-8") as fp:
-        reader = csv.DictReader(fp)
-        if "email" not in reader.fieldnames:
-            raise ValueError("CSV must contain an 'email' column.")
-        for row in reader:
-            email = row.pop("email").strip()
-            name = row.pop("name", "").strip()
-            recipients.append(Recipient(email=email, name=name, extra=row))
-    logger.info("Loaded %d recipient(s) from %s", len(recipients), csv_path)
+    path = Path(csv_path)
+    if not path.is_file():
+        raise FileNotFoundError(f"CSV file not found: {path}")
+
+    recipients: List[Dict[str, str]] = []
+    try:
+        with path.open(newline="", encoding="utf-8") as f:
+            reader = csv.DictReader(f)
+            for row_number, row in enumerate(reader, start=2):  # start=2 accounts for header line
+                if not row:
+                    LOGGER.warning("Empty row encountered at line %d; skipping.", row_number)
+                    continue
+                recipients.append({k: v.strip() for k, v in row.items() if k})
+    except PermissionError as exc:
+        raise PermissionError(f"Cannot read CSV file {path}: {exc}") from exc
+    except csv.Error as exc:
+        raise csv.Error(f"Error parsing CSV file {path}: {exc}") from exc
+
+    LOGGER.info("Loaded %d recipient(s) from %s.", len(recipients), path)
     return recipients
 
 
-def render_template(template_str: str, context: Mapping[str, str]) -> str:
-    """
-    Render a template string using :class:`string.Template`.
+def render_template(template_str: str, context: Dict[str, Any]) -> str:
+    """Render a template string with the provided context.
 
-    Placeholders are written as ``${placeholder}`` according to the
-    ``Template`` syntax.
+    Uses :class:`string.Template` for placeholder substitution. Placeholders
+    are denoted by ``${variable}``. Missing placeholders raise a ``KeyError``.
 
     Args:
-        template_str: The raw template text.
-        context: Mapping of placeholder names to their replacement values.
+        template_str: Raw template text.
+        context: Mapping of placeholder names to replacement values.
 
     Returns:
-        Rendered string.
+        Rendered string with all placeholders replaced.
 
     Raises:
-        KeyError: If a placeholder is missing in ``context``.
+        KeyError: If the template contains placeholders not present in ``context``.
+        ValueError: If the template string is malformed.
     """
     try:
-        template = Template(template_str)
-        return template.substitute(context)
+        tmpl = Template(template_str)
+        return tmpl.substitute(context)
     except KeyError as exc:
         missing = exc.args[0]
-        raise KeyError(f"Missing placeholder '{missing}' for template rendering.") from exc
+        raise KeyError(f"Missing placeholder '{missing}' in context for template.") from exc
+    except ValueError as exc:
+        raise ValueError(f"Invalid template syntax: {exc}") from exc
 
 
 def send_email(
-    smtp_cfg: SMTPConfig,
+    smtp_config: SMTPConfig,
     sender: str,
-    recipient: Recipient,
+    recipient: str,
     subject: str,
     body: str,
 ) -> None:
-    """
-    Send a single email via SMTP.
+    """Send a single email via SMTP with TLS (if configured).
 
     Args:
-        smtp_cfg: SMTP configuration.
-        sender: Email address appearing in the ``From`` header.
-        recipient: Recipient data.
-        subject: Email subject.
-        body: Email body (plain text).
+        smtp_config: SMTP connection parameters.
+        sender: Email address of the sender (must match SMTP authentication).
+        recipient: Destination email address.
+        subject: Email subject line.
+        body: Plain‑text email body.
 
     Raises:
         smtplib.SMTPException: For any SMTP‑related errors.
+        ssl.SSLError: For TLS/SSL negotiation failures.
     """
     message = EmailMessage()
     message["From"] = sender
-    message["To"] = recipient.email
+    message["To"] = recipient
     message["Subject"] = subject
     message.set_content(body)
 
     context = ssl.create_default_context()
     try:
-        with smtplib.SMTP(smtp_cfg.host, smtp_cfg.port, timeout=smtp_cfg.timeout) as server:
-            if smtp_cfg.use_tls:
+        with smtplib.SMTP(smtp_config.host, smtp_config.port, timeout=30) as server:
+            server.ehlo()
+            if smtp_config.use_tls:
                 server.starttls(context=context)
-                logger.debug("Started TLS with %s:%s", smtp_cfg.host, smtp_cfg.port)
-            server.login(smtp_cfg.username, smtp_cfg.password)
+                server.ehlo()
+            if smtp_config.username and smtp_config.password:
+                server.login(smtp_config.username, smtp_config.password)
             server.send_message(message)
-        logger.info("Email sent to %s <%s>", recipient.name, recipient.email)
-    except smtplib.SMTPException as exc:
-        logger.error(
-            "Failed to send email to %s <%s>: %s", recipient.name, recipient.email, exc
-        )
+        LOGGER.info("Email sent to %s", recipient)
+    except (smtplib.SMTPException, ssl.SSLError) as exc:
+        LOGGER.error("Failed to send email to %s: %s", recipient, exc)
         raise
 
 
-def build_smtp_config_from_env() -> SMTPConfig:
-    """
-    Construct :class:`SMTPConfig` from environment variables.
+def load_template(template_path: str | Path) -> str:
+    """Read the raw template text from a file.
 
-    Expected variables:
-        - SMTP_HOST
-        - SMTP_PORT
-        - SMTP_USER
-        - SMTP_PASS
-        - SMTP_TLS (optional, defaults to ``1``)
+    Args:
+        template_path: Path to the file containing the email template.
 
     Returns:
-        Filled :class:`SMTPConfig` instance.
+        The template as a string.
 
     Raises:
-        EnvironmentError: If any required variable is missing or malformed.
+        FileNotFoundError: If the template file does not exist.
+        PermissionError: If the file cannot be read.
+        OSError: For other I/O related issues.
     """
+    path = Path(template_path)
+    if not path.is_file():
+        raise FileNotFoundError(f"Template file not found: {path}")
+
     try:
-        host = os.environ["SMTP_HOST"]
-        port = int(os.environ.get("SMTP_PORT", "587"))
-        username = os.environ["SMTP_USER"]
-        password = os.environ["SMTP_PASS"]
-        use_tls = os.environ.get("SMTP_TLS", "1") not in {"0", "false", "False"}
-        return SMTPConfig(host=host, port=port, username=username, password=password, use_tls=use_tls)
-    except KeyError as exc:
-        raise EnvironmentError(f"Missing required SMTP environment variable: {exc}") from exc
-    except ValueError as exc:
-        raise EnvironmentError("SMTP_PORT must be an integer.") from exc
-
-
-def main() -> None:
-    """Entry point for the CLI."""
-    parser = ArgumentParser(description="Send personalised emails from a CSV list.")
-    parser.add_argument(
-        "csv_path", help="Path to CSV file containing at least an 'email' column."
-    )
-    parser.add_argument(
-        "template_path", help="Path to a plain‑text email template file."
-    )
-    parser.add_argument(
-        "--subject", required=True, help="Subject line for the email."
-    )
-    parser.add_argument(
-        "--sender", required=True, help="Sender email address (From header)."
-    )
-    args = parser.parse_args()
-
-    # Load configuration, template and recipients
-    smtp_cfg = build_smtp_config_from_env()
-    try:
-        with open(args.template_path, "r", encoding="utf-8") as f:
-            template_str = f.read()
+        content = path.read_text(encoding="utf-8")
+        LOGGER.debug("Loaded template from %s (size: %d bytes).", path, len(content))
+        return content
+    except PermissionError as exc:
+        raise PermissionError(f"Cannot read template file {path}: {exc}") from exc
     except OSError as exc:
-        logger.critical("Unable to read template file: %s", exc)
-        sys.exit(1)
+        raise OSError(f"Error reading template file {path}: {exc}") from exc
 
-    try:
-        recipients = load_recipients(args.csv_path)
-    except Exception as exc:
-        logger.critical("Failed to load recipients: %s", exc)
-        sys.exit(1)
 
-    # Process each recipient
-    for recipient in recipients:
-        # Merge built‑in fields with any extra columns from the CSV
-        context: Dict[str, str] = {
-            "email": recipient.email,
-            "name": recipient.name,
-            **recipient.extra,
-        }
+def send_bulk_emails(
+    csv_path: str | Path,
+    template_path: str | Path,
+    smtp_config: SMTPConfig,
+    sender: str,
+    subject: str,
+) -> None:
+    """Orchestrate loading recipients, rendering templates, and sending emails.
+
+    Args:
+        csv_path: Path to CSV file with recipient data.
+        template_path: Path to the email body template.
+        smtp_config: SMTP connection configuration.
+        sender: Email address used as the "From" field.
+        subject: Subject line template (supports ``${placeholder}`` syntax).
+
+    Raises:
+        Exception: Propagates any exception raised during processing.
+    """
+    recipients = load_recipients(csv_path)
+    raw_template = load_template(template_path)
+
+    for recipient_data in recipients:
+        # Ensure required fields exist
+        if "email" not in recipient_data:
+            LOGGER.warning("Recipient entry missing 'email' field; skipping: %s", recipient_data)
+            continue
+
+        # Render subject and body
         try:
-            body = render_template(template_str, context)
-        except KeyError as exc:
-            logger.error("Skipping %s <%s>: %s", recipient.name, recipient.email, exc)
+            rendered_subject = render_template(subject, recipient_data)
+            rendered_body = render_template(raw_template, recipient_data)
+        except (KeyError, ValueError) as exc:
+            LOGGER.error("Template rendering failed for %s: %s", recipient_data.get("email"), exc)
             continue
 
         try:
             send_email(
-                smtp_cfg=smtp_cfg,
-                sender=args.sender,
-                recipient=recipient,
-                subject=args.subject,
-                body=body,
+                smtp_config=smtp_config,
+                sender=sender,
+                recipient=recipient_data["email"],
+                subject=rendered_subject,
+                body=rendered_body,
             )
-        except smtplib.SMTPException:
-            # Error already logged inside ``send_email``; continue with next.
+        except Exception:
+            # Already logged inside send_email; continue with next recipient
             continue
 
 
+# --------------------------------------------------------------------------- #
+# Example entry‑point (executed when run as a script)
+# --------------------------------------------------------------------------- #
 if __name__ == "__main__":
-    main()
+    import argparse
+    import sys
+
+    parser = argparse.ArgumentParser(
+        description="Send bulk templated emails from a CSV list."
+    )
+    parser.add_argument("csv", help="Path to CSV file with recipient data.")
+    parser.add_argument("template", help="Path to email body template file.")
+    parser.add_argument(
+        "--subject",
+        required=True,
+        help="Subject line template (use ${placeholder} for variables).",
+    )
+    parser.add_argument(
+        "--sender",
+        required=True,
+        help="Sender email address (must match SMTP credentials).",
+    )
+    parser.add_argument(
+        "--smtp-host",
+        required=True,
+        help="SMTP server hostname.",
+    )
+    parser.add_argument(
+        "--smtp-port",
+        type=int,
+        default=587,
+        help="SMTP server port (default: 587).",
+    )
+    parser.add_argument(
+        "--smtp-user",
+        required=True,
+        help="SMTP username.",
+    )
+    parser.add_argument(
+        "--smtp-pass-env",
+        default="SMTP_PASSWORD",
+        help=(
+            "Name of environment variable that holds the SMTP password. "
+            "Do NOT pass passwords on the command line."
+        ),
+    )
+    parser.add_argument(
+        "--no-tls",
+        action="store_true",
+        help="Disable STARTTLS. Use only if the server requires plain connection.",
+    )
+
+    args = parser.parse_args()
+
+    smtp_password = os.getenv(args.smtp_pass_env)
+    if not smtp_password:
+        LOGGER.error("SMTP password not found in environment variable '%s'.", args.smtp_pass_env)
+        sys.exit(1)
+
+    config = SMTPConfig(
+        host=args.smtp_host,
+        port=args.smtp_port,
+        username=args.smtp_user,
+        password=smtp_password,
+        use_tls=not args.no_tls,
+    )
+
+    try:
+        send_bulk_emails(
+            csv_path=args.csv,
+            template_path=args.template,
+            smtp_config=config,
+            sender=args.sender,
+            subject=args.subject,
+        )
+    except Exception as exc:
+        LOGGER.exception("Unhandled exception during bulk send: %s", exc)
+        sys.exit(1)

@@ -1,135 +1,208 @@
 """
-Simple e‑commerce REST API using FastAPI.
+ecommerce_api.py
+----------------
+A minimal e-commerce REST API implemented with FastAPI.
 
 Endpoints
----------
-GET /products
-    List all available products.
+~~~~~~~~~
+* GET /products               – List all available products.
+* GET /products/{product_id}  – Retrieve a single product.
+* POST /cart                  – Add a product to the shopping cart.
+* GET /cart                   – Retrieve current cart contents.
+* DELETE /cart/{item_id}      – Remove an item from the cart.
 
-GET /products/{product_id}
-    Retrieve details of a single product.
-
-POST /cart
-    Add a product to the current user's cart.
-    Body: {"product_id": int, "quantity": int}
-
-GET /cart
-    Retrieve the current user's cart contents.
-
-DELETE /cart/{item_id}
-    Remove a cart item by its identifier.
-
-Security
---------
-- API key authentication via the "X-API-Key" header.
-- CORS middleware for controlled origins.
-- Input validation with Pydantic models.
+The implementation uses in‑memory storage for demonstration purposes,
+includes type hints, comprehensive docstrings, explicit error handling,
+and basic security best practices (CORS, input validation, and a simple
+API key authentication scheme).
 """
 
 from __future__ import annotations
 
 import uuid
-from typing import List, Dict
+from typing import Dict, List, Optional
 
-from fastapi import FastAPI, HTTPException, Depends, Header, status
+from fastapi import (
+    Body,
+    Depends,
+    FastAPI,
+    HTTPException,
+    Request,
+    Response,
+    status,
+)
+from fastapi.security.api_key import APIKeyHeader, APIKey
 from fastapi.middleware.cors import CORSMiddleware
-from pydantic import BaseModel, Field, PositiveInt, conint
+from pydantic import BaseModel, Field, PositiveInt, validator
 
-# -------------------- Configuration --------------------
-API_KEY = "super-secret-api-key"  # In production, load from env/secret manager
-ALLOWED_ORIGINS = ["http://localhost", "http://127.0.0.1"]
+# --------------------------------------------------------------------------- #
+# Configuration & Security
+# --------------------------------------------------------------------------- #
+
+API_KEY_NAME = "X-API-Key"
+# In a real application this would be stored securely (e.g., env variable, vault)
+API_KEY = "super-secret-key"
+
+api_key_header = APIKeyHeader(name=API_KEY_NAME, auto_error=False)
 
 
-def verify_api_key(x_api_key: str = Header(..., alias="X-API-Key")) -> None:
+def get_api_key(
+    api_key: Optional[str] = Depends(api_key_header),
+) -> APIKey:
     """
-    Simple API‑key dependency. Raises 401 if the key does not match.
+    Validate the supplied API key.
+
+    Raises
+    ------
+    HTTPException
+        If the API key is missing or invalid.
     """
-    if x_api_key != API_KEY:
-        raise HTTPException(
-            status_code=status.HTTP_401_UNAUTHORIZED,
-            detail="Invalid API key",
-            headers={"WWW-Authenticate": "API key"},
-        )
+    if api_key == API_KEY:
+        return api_key
+    raise HTTPException(
+        status_code=status.HTTP_403_FORBIDDEN,
+        detail="Could not validate credentials",
+    )
 
 
-# -------------------- Data Models --------------------
+# --------------------------------------------------------------------------- #
+# Data Models
+# --------------------------------------------------------------------------- #
+
 class Product(BaseModel):
-    id: int
-    name: str = Field(..., max_length=100)
-    description: str = Field("", max_length=500)
-    price_cents: PositiveInt  # store price in cents to avoid floating point issues
-    in_stock: conint(ge=0)
+    """Represent a product available for purchase."""
+    id: uuid.UUID = Field(default_factory=uuid.uuid4, description="Unique product identifier")
+    name: str = Field(..., min_length=1, max_length=100)
+    description: Optional[str] = Field(None, max_length=500)
+    price_cents: PositiveInt = Field(..., description="Price in cents to avoid floating point issues")
+    in_stock: PositiveInt = Field(..., description="Number of items available")
 
-
-class ProductCreate(Product):
-    """Model for creating a product – currently unused but kept for extensibility."""
+    @validator("price_cents", "in_stock")
+    def non_negative(cls, v: int) -> int:
+        if v < 0:
+            raise ValueError("must be non‑negative")
+        return v
 
 
 class CartItem(BaseModel):
-    id: str  # UUID string
-    product_id: int
-    quantity: PositiveInt
-    total_price_cents: PositiveInt
+    """Represent an item stored in a shopping cart."""
+    id: uuid.UUID = Field(default_factory=uuid.uuid4, description="Unique cart‑item identifier")
+    product_id: uuid.UUID = Field(..., description="Identifier of the product")
+    quantity: PositiveInt = Field(..., description="Quantity of the product in the cart")
+
+    @validator("quantity")
+    def quantity_positive(cls, v: int) -> int:
+        if v <= 0:
+            raise ValueError("quantity must be greater than zero")
+        return v
 
 
 class AddToCartRequest(BaseModel):
-    product_id: int
-    quantity: PositiveInt = 1
+    """Payload for adding a product to the cart."""
+    product_id: uuid.UUID = Field(..., description="Identifier of the product to add")
+    quantity: PositiveInt = Field(..., description="Quantity to add")
 
 
-# -------------------- In‑Memory Store --------------------
-# In real applications replace with a persistent DB.
-_products: Dict[int, Product] = {
-    1: Product(id=1, name="T‑Shirt", description="Cotton t‑shirt", price_cents=1999, in_stock=50),
-    2: Product(id=2, name="Coffee Mug", description="Ceramic mug", price_cents=1299, in_stock=120),
-    3: Product(id=3, name="Notebook", description="Paper notebook", price_cents=799, in_stock=200),
-}
-_user_carts: Dict[str, Dict[str, CartItem]] = {}  # api_key -> {item_id: CartItem}
+# --------------------------------------------------------------------------- #
+# In‑Memory Data Stores (for demonstration only)
+# --------------------------------------------------------------------------- #
+
+_PRODUCTS: Dict[uuid.UUID, Product] = {}
+_CART: Dict[uuid.UUID, CartItem] = {}
 
 
-# -------------------- FastAPI App --------------------
+def _initialize_demo_data() -> None:
+    """Populate the product catalog with a few sample items."""
+    sample_products = [
+        Product(name="Wireless Mouse", description="Ergonomic mouse", price_cents=2599, in_stock=150),
+        Product(name="Mechanical Keyboard", description="RGB backlit", price_cents=7499, in_stock=85),
+        Product(name="USB‑C Hub", description="7‑port hub", price_cents=3299, in_stock=200),
+    ]
+    for prod in sample_products:
+        _PRODUCTS[prod.id] = prod
+
+
+_initialize_demo_data()
+
+
+# --------------------------------------------------------------------------- #
+# FastAPI Application
+# --------------------------------------------------------------------------- #
+
 app = FastAPI(
     title="Simple E‑Commerce API",
+    description="A minimal example of an e‑commerce backend using FastAPI.",
     version="1.0.0",
-    description="Demo API for product catalog and shopping cart operations.",
-    dependencies=[Depends(verify_api_key)],
 )
 
+# Allow only safe origins; adjust as needed for production.
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=ALLOWED_ORIGINS,
+    allow_origins=["https://example.com"],  # Replace with your front‑end domain(s)
     allow_credentials=True,
     allow_methods=["GET", "POST", "DELETE"],
-    allow_headers=["*"],
+    allow_headers=[API_KEY_NAME, "Content-Type"],
 )
 
 
-# -------------------- Helper Functions --------------------
-def get_cart(api_key: str) -> Dict[str, CartItem]:
-    """Retrieve or initialise a cart for the given API key."""
-    return _user_carts.setdefault(api_key, {})
+# --------------------------------------------------------------------------- #
+# Endpoint Implementations
+# --------------------------------------------------------------------------- #
 
-
-def calculate_total_price(product: Product, quantity: int) -> int:
-    """Return total price in cents."""
-    return product.price_cents * quantity
-
-
-# -------------------- Endpoints --------------------
-@app.get("/products", response_model=List[Product])
-def list_products() -> List[Product]:
+@app.get(
+    "/products",
+    response_model=List[Product],
+    summary="List all products",
+    tags=["products"],
+)
+def list_products(_: APIKey = Depends(get_api_key)) -> List[Product]:
     """
-    Return a list of all products.
+    Return a list of all products in the catalog.
+
+    Parameters
+    ----------
+    _: APIKey
+        Dependency that ensures a valid API key is provided.
+
+    Returns
+    -------
+    List[Product]
+        All available products.
     """
-    return list(_products.values())
+    return list(_PRODUCTS.values())
 
 
-@app.get("/products/{product_id}", response_model=Product)
-def get_product(product_id: int) -> Product:
+@app.get(
+    "/products/{product_id}",
+    response_model=Product,
+    summary="Retrieve a product",
+    tags=["products"],
+)
+def get_product(
+    product_id: uuid.UUID,
+    _: APIKey = Depends(get_api_key),
+) -> Product:
     """
-    Return details for a single product.
+    Retrieve a single product by its identifier.
+
+    Parameters
+    ----------
+    product_id : uuid.UUID
+        Identifier of the product to fetch.
+    _: APIKey
+        Dependency that ensures a valid API key is provided.
+
+    Returns
+    -------
+    Product
+        The requested product.
+
+    Raises
+    ------
+    HTTPException
+        If the product does not exist (404).
     """
-    product = _products.get(product_id)
+    product = _PRODUCTS.get(product_id)
     if not product:
         raise HTTPException(status_code=404, detail="Product not found")
     return product
@@ -139,81 +212,131 @@ def get_product(product_id: int) -> Product:
     "/cart",
     response_model=CartItem,
     status_code=status.HTTP_201_CREATED,
+    summary="Add product to cart",
+    tags=["cart"],
 )
 def add_to_cart(
-    payload: AddToCartRequest,
-    api_key: str = Depends(lambda x_api_key=Header(..., alias="X-API-Key"): x_api_key),
+    payload: AddToCartRequest = Body(..., description="Product and quantity to add"),
+    _: APIKey = Depends(get_api_key),
 ) -> CartItem:
     """
-    Add a product to the authenticated user's cart.
+    Add a product to the shopping cart.
+
+    The endpoint validates product existence, stock availability, and
+    quantity constraints before creating a new cart item.
+
+    Parameters
+    ----------
+    payload : AddToCartRequest
+        The product ID and quantity to add.
+    _: APIKey
+        Dependency that ensures a valid API key is provided.
+
+    Returns
+    -------
+    CartItem
+        The newly created cart item.
+
+    Raises
+    ------
+    HTTPException
+        * 404 – Product not found.
+        * 400 – Insufficient stock.
     """
-    product = _products.get(payload.product_id)
+    product = _PRODUCTS.get(payload.product_id)
     if not product:
         raise HTTPException(status_code=404, detail="Product not found")
-    if product.in_stock < payload.quantity:
+
+    if payload.quantity > product.in_stock:
         raise HTTPException(
             status_code=400,
-            detail=f"Insufficient stock. Available: {product.in_stock}",
+            detail=f"Requested quantity ({payload.quantity}) exceeds stock ({product.in_stock})",
         )
 
-    cart = get_cart(api_key)
-
-    # Create a new cart item
-    item_id = str(uuid.uuid4())
-    total_price = calculate_total_price(product, payload.quantity)
-    cart_item = CartItem(
-        id=item_id,
-        product_id=product.id,
-        quantity=payload.quantity,
-        total_price_cents=total_price,
-    )
-    cart[item_id] = cart_item
-
-    # Decrease product stock
+    # Decrement stock atomically (simplified for in‑memory store)
     product.in_stock -= payload.quantity
 
+    cart_item = CartItem(product_id=payload.product_id, quantity=payload.quantity)
+    _CART[cart_item.id] = cart_item
     return cart_item
 
 
-@app.get("/cart", response_model=List[CartItem])
-def view_cart(
-    api_key: str = Depends(lambda x_api_key=Header(..., alias="X-API-Key"): x_api_key),
-) -> List[CartItem]:
+@app.get(
+    "/cart",
+    response_model=List[CartItem],
+    summary="View cart contents",
+    tags=["cart"],
+)
+def view_cart(_: APIKey = Depends(get_api_key)) -> List[CartItem]:
     """
-    Retrieve the current user's cart items.
+    Retrieve all items currently stored in the shopping cart.
+
+    Parameters
+    ----------
+    _: APIKey
+        Dependency that ensures a valid API key is provided.
+
+    Returns
+    -------
+    List[CartItem]
+        List of cart items.
     """
-    cart = get_cart(api_key)
-    return list(cart.values())
+    return list(_CART.values())
 
 
-@app.delete("/cart/{item_id}", status_code=status.HTTP_204_NO_CONTENT)
-def remove_from_cart(
-    item_id: str,
-    api_key: str = Depends(lambda x_api_key=Header(..., alias="X-API-Key"): x_api_key),
-) -> None:
+@app.delete(
+    "/cart/{item_id}",
+    status_code=status.HTTP_204_NO_CONTENT,
+    summary="Remove item from cart",
+    tags=["cart"],
+)
+def delete_cart_item(
+    item_id: uuid.UUID,
+    _: APIKey = Depends(get_api_key),
+) -> Response:
     """
-    Remove a cart item and restore product stock.
+    Delete a specific cart item, restoring the product stock.
+
+    Parameters
+    ----------
+    item_id : uuid.UUID
+        Identifier of the cart item to delete.
+    _: APIKey
+        Dependency that ensures a valid API key is provided.
+
+    Returns
+    -------
+    Response
+        Empty response with HTTP 204 status.
+
+    Raises
+    ------
+    HTTPException
+        If the cart item does not exist (404).
     """
-    cart = get_cart(api_key)
-    cart_item = cart.pop(item_id, None)
+    cart_item = _CART.pop(item_id, None)
     if not cart_item:
         raise HTTPException(status_code=404, detail="Cart item not found")
 
     # Restore stock
-    product = _products.get(cart_item.product_id)
+    product = _PRODUCTS.get(cart_item.product_id)
     if product:
         product.in_stock += cart_item.quantity
-    # No content returned
+
+    return Response(status_code=status.HTTP_204_NO_CONTENT)
 
 
-# -------------------- Run Server (optional) --------------------
-# The block below enables running the app with `python this_file.py`.
+# --------------------------------------------------------------------------- #
+# Application Entry Point
+# --------------------------------------------------------------------------- #
+
 if __name__ == "__main__":
     import uvicorn
 
     uvicorn.run(
-        "main:app",  # Adjust if saved under a different filename
-        host="0.0.0.0",
+        "ecommerce_api:app",
+        host="127.0.0.1",
         port=8000,
-        reload=True,
+        log_level="info",
+        reload=False,
     )

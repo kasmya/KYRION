@@ -1,209 +1,363 @@
 """
-Web scraper utility extracting hyperlinks, images, title, meta description,
-and headings (h1, h2, h3) from a given URL.
+web_scraper.py
 
-Features
---------
-* Type‑annotated functions.
-* Detailed docstrings.
-* URL validation using urllib.
-* Network error handling (timeouts, connection errors, invalid responses).
-* Security‑focused defaults (SSL verification, reasonable timeout, limiting
-  redirects).
-* No external side effects – the module only returns data structures.
+A minimal web scraper that retrieves the following information from a given URL:
+
+* All hyperlinks (the ``href`` attribute of ``<a>`` tags)
+* All images (the ``src`` attribute of ``<img>`` tags)
+* The page title
+* The meta description (content of ``<meta name="description">``)
+* All headings ``<h1>``, ``<h2>`` and ``<h3>``
+
+The module uses only the standard library together with the widely‑used
+``requests`` and ``beautifulsoup4`` packages.  It follows security best
+practices by:
+
+* Verifying SSL certificates
+* Setting a sensible timeout
+* Limiting the maximum amount of data downloaded (5 MiB)
+
+Typical usage::
+
+    from web_scraper import scrape_url
+
+    result = scrape_url("https://example.com")
+    print(result.title)
+    print(result.links)
 """
 
 from __future__ import annotations
 
 import sys
+import argparse
 import logging
-from dataclasses import dataclass, asdict
-from typing import List, Dict, Any
-from urllib.parse import urlparse, urljoin
+from dataclasses import dataclass, field
+from typing import List, Dict, Optional, Iterable
 
 import requests
-from bs4 import BeautifulSoup, SoupStrainer, FeatureNotFound
+from bs4 import BeautifulSoup, SoupStrainer, Tag
 
-# --------------------------------------------------------------------------- #
-# Configuration
-# --------------------------------------------------------------------------- #
-DEFAULT_TIMEOUT: int = 10  # seconds
-MAX_REDIRECTS: int = 5
-USER_AGENT: str = "Mozilla/5.0 (compatible; WebScraper/1.0; +https://example.com/bot)"
+# Configure a module‑level logger
+logger = logging.getLogger(__name__)
+handler = logging.StreamHandler(sys.stderr)
+formatter = logging.Formatter("[%(levelname)s] %(message)s")
+handler.setFormatter(formatter)
+logger.addHandler(handler)
+logger.setLevel(logging.INFO)
+
+# ---------------------------------------------------------------------------
+
+_MAX_CONTENT_SIZE = 5 * 1024 * 1024  # 5 MiB
+_DEFAULT_TIMEOUT = 10  # seconds
+_USER_AGENT = (
+    "web-scraper/1.0 (+https://github.com/yourname/web-scraper) "
+    "requests/{}".format(requests.__version__)
+)
 
 
-# --------------------------------------------------------------------------- #
-# Data structures
-# --------------------------------------------------------------------------- #
+class ScraperError(Exception):
+    """Base exception for scraper related errors."""
+
+
+class ContentTooLargeError(ScraperError):
+    """Raised when the downloaded content exceeds the allowed size."""
+
+
 @dataclass
-class ScrapeResult:
-    """Container for all extracted data."""
+class ScrapedData:
+    """Container for the extracted information of a web page."""
+
     url: str
-    title: str | None
-    meta_description: str | None
-    hyperlinks: List[str]
-    images: List[str]
-    headings: Dict[str, List[str]]  # keys: h1, h2, h3
+    title: Optional[str] = None
+    meta_description: Optional[str] = None
+    links: List[str] = field(default_factory=list)
+    images: List[str] = field(default_factory=list)
+    headings: Dict[str, List[str]] = field(default_factory=lambda: {"h1": [], "h2": [], "h3": []})
 
 
-# --------------------------------------------------------------------------- #
-# Helper functions
-# --------------------------------------------------------------------------- #
-def _is_valid_url(url: str) -> bool:
-    """Return True if `url` has a valid scheme and netloc."""
-    parsed = urlparse(url)
-    return parsed.scheme in {"http", "https"} and bool(parsed.netloc)
-
-
-def _make_absolute(base: str, link: str) -> str:
-    """Convert a possibly relative link to an absolute URL."""
-    return urljoin(base, link)
-
-
-def _extract_text_from_tags(soup: BeautifulSoup, tag_name: str) -> List[str]:
-    """Return stripped text from all tags of `tag_name`."""
-    return [element.get_text(strip=True) for element in soup.find_all(tag_name)]
-
-
-# --------------------------------------------------------------------------- #
-# Core scraping logic
-# --------------------------------------------------------------------------- #
-def scrape_page(url: str) -> ScrapeResult:
+def _download(url: str) -> str:
     """
-    Fetch a page and extract hyperlinks, images, title, meta description,
-    and H1–H3 headings.
+    Download the HTML content of *url*.
+
+    The request is performed with SSL verification, a custom User‑Agent,
+    a timeout and a size limit.
 
     Parameters
     ----------
     url: str
-        The target page URL. Must be a fully qualified HTTP/HTTPS URL.
+        The absolute URL to download.
 
     Returns
     -------
-    ScrapeResult
-        Data class containing the extracted information.
+    str
+        The decoded HTML content.
 
     Raises
     ------
-    ValueError
-        If the URL is malformed or uses an unsupported scheme.
-    requests.RequestException
-        For network‑related errors (connection problems, timeouts, etc.).
-    RuntimeError
-        If the HTML parser cannot be initialized.
+    ScraperError
+        If the request fails or the content is too large.
     """
-    if not _is_valid_url(url):
-        raise ValueError(f"Invalid URL: {url!r}")
-
-    session = requests.Session()
-    session.headers.update({"User-Agent": USER_AGENT})
-    adapter = requests.adapters.HTTPAdapter(max_retries=MAX_REDIRECTS)
-    session.mount("http://", adapter)
-    session.mount("https://", adapter)
-
+    headers = {"User-Agent": _USER_AGENT}
     try:
-        resp = session.get(url, timeout=DEFAULT_TIMEOUT, allow_redirects=True, verify=True)
-        resp.raise_for_status()
+        with requests.get(
+            url,
+            headers=headers,
+            timeout=_DEFAULT_TIMEOUT,
+            stream=True,
+            allow_redirects=True,
+            verify=True,
+        ) as resp:
+            resp.raise_for_status()
+            content_chunks: List[bytes] = []
+            size = 0
+            for chunk in resp.iter_content(chunk_size=8192):
+                if not chunk:
+                    continue
+                size += len(chunk)
+                if size > _MAX_CONTENT_SIZE:
+                    raise ContentTooLargeError(f"Content size exceeds {_MAX_CONTENT_SIZE} bytes")
+                content_chunks.append(chunk)
+            raw_content = b"".join(content_chunks)
+            encoding = resp.encoding if resp.encoding else "utf-8"
+            return raw_content.decode(encoding, errors="replace")
     except requests.RequestException as exc:
-        raise requests.RequestException(f"Network error while fetching {url!r}: {exc}") from exc
+        raise ScraperError(f"Failed to download {url!r}: {exc}") from exc
+    except ContentTooLargeError:
+        raise
+    except Exception as exc:  # pragma: no cover
+        raise ScraperError(f"Unexpected error while downloading {url!r}: {exc}") from exc
 
-    # Parse only the parts we care about to limit memory usage.
-    try:
-        # Using SoupStrainer can improve performance for large pages.
-        strainer = SoupStrainer(["a", "img", "title", "meta", "h1", "h2", "h3"])
-        soup = BeautifulSoup(resp.text, "html.parser", parse_only=strainer)
-    except FeatureNotFound as exc:
-        raise RuntimeError("HTML parser not found in your environment.") from exc
 
-    # Title
+def _extract_title(soup: BeautifulSoup) -> Optional[str]:
+    """
+    Return the page title if present.
+
+    Parameters
+    ----------
+    soup: BeautifulSoup
+        Parsed HTML document.
+
+    Returns
+    -------
+    Optional[str]
+        The title text or ``None`` if not found.
+    """
     title_tag = soup.title
-    title = title_tag.string.strip() if title_tag and title_tag.string else None
+    return title_tag.string.strip() if title_tag and title_tag.string else None
 
-    # Meta description
-    meta_desc_tag = soup.find("meta", attrs={"name": "description"}) or soup.find(
-        "meta", attrs={"property": "og:description"}
+
+def _extract_meta_description(soup: BeautifulSoup) -> Optional[str]:
+    """
+    Return the content of the ``<meta name="description">`` tag.
+
+    Parameters
+    ----------
+    soup: BeautifulSoup
+        Parsed HTML document.
+
+    Returns
+    -------
+    Optional[str]
+        The description text or ``None`` if not found.
+    """
+    tag = soup.find("meta", attrs={"name": "description"})
+    if tag and isinstance(tag, Tag):
+        return tag.get("content", "").strip() or None
+    return None
+
+
+def _extract_links(soup: BeautifulSoup) -> List[str]:
+    """
+    Extract all ``href`` attributes from ``<a>`` tags.
+
+    Parameters
+    ----------
+    soup: BeautifulSoup
+        Parsed HTML document.
+
+    Returns
+    -------
+    List[str]
+        List of hyperlink URLs (may be relative).
+    """
+    links: List[str] = []
+    for a in soup.find_all("a", href=True):
+        href = a.get("href")
+        if href:
+            links.append(href.strip())
+    return links
+
+
+def _extract_images(soup: BeautifulSoup) -> List[str]:
+    """
+    Extract all ``src`` attributes from ``<img>`` tags.
+
+    Parameters
+    ----------
+    soup: BeautifulSoup
+        Parsed HTML document.
+
+    Returns
+    -------
+    List[str]
+        List of image source URLs (may be relative).
+    """
+    images: List[str] = []
+    for img in soup.find_all("img", src=True):
+        src = img.get("src")
+        if src:
+            images.append(src.strip())
+    return images
+
+
+def _extract_headings(soup: BeautifulSoup) -> Dict[str, List[str]]:
+    """
+    Extract text from ``<h1>``, ``<h2>`` and ``<h3>`` elements.
+
+    Parameters
+    ----------
+    soup: BeautifulSoup
+        Parsed HTML document.
+
+    Returns
+    -------
+    Dict[str, List[str]]
+        Mapping from tag name to a list of heading texts.
+    """
+    headings: Dict[str, List[str]] = {"h1": [], "h2": [], "h3": []}
+    for tag_name in headings.keys():
+        for tag in soup.find_all(tag_name):
+            text = tag.get_text(separator=" ", strip=True)
+            if text:
+                headings[tag_name].append(text)
+    return headings
+
+
+def _parse_html(html: str, url: str) -> ScrapedData:
+    """
+    Parse *html* and extract the required information.
+
+    Parameters
+    ----------
+    html: str
+        The raw HTML content.
+    url: str
+        The URL the HTML originated from (stored for reference).
+
+    Returns
+    -------
+    ScrapedData
+        Populated data container.
+    """
+    # Only parse the parts we need to keep memory usage low.
+    strainer = SoupStrainer(["title", "meta", "a", "img", "h1", "h2", "h3"])
+    soup = BeautifulSoup(html, "html.parser", parse_only=strainer)
+
+    data = ScrapedData(url=url)
+    data.title = _extract_title(soup)
+    data.meta_description = _extract_meta_description(soup)
+    data.links = _extract_links(soup)
+    data.images = _extract_images(soup)
+    data.headings = _extract_headings(soup)
+    return data
+
+
+def scrape_url(url: str) -> ScrapedData:
+    """
+    Download *url* and extract hyperlinks, images, title, meta description,
+    and ``h1``/``h2``/``h3`` headings.
+
+    Parameters
+    ----------
+    url: str
+        The target URL (must be absolute).
+
+    Returns
+    -------
+    ScrapedData
+        An object containing the extracted information.
+
+    Raises
+    ------
+    ScraperError
+        If any network or parsing error occurs.
+    """
+    logger.info("Scraping %s", url)
+    html = _download(url)
+    return _parse_html(html, url)
+
+
+def _parse_cli_args(argv: Optional[Iterable[str]] = None) -> argparse.Namespace:
+    """
+    Parse command‑line arguments.
+
+    Parameters
+    ----------
+    argv: Optional[Iterable[str]]
+        Argument list to parse; defaults to ``sys.argv[1:]``.
+
+    Returns
+    -------
+    argparse.Namespace
+        Parsed arguments.
+    """
+    parser = argparse.ArgumentParser(description="Simple web scraper")
+    parser.add_argument("url", help="The URL to scrape")
+    parser.add_argument(
+        "-v",
+        "--verbose",
+        action="store_true",
+        help="Enable verbose (debug) logging",
     )
-    meta_description = (
-        meta_desc_tag["content"].strip() if meta_desc_tag and meta_desc_tag.get("content") else None
-    )
-
-    # Hyperlinks
-    raw_links = [a.get("href") for a in soup.find_all("a", href=True)]
-    hyperlinks = [_make_absolute(url, link) for link in raw_links if link]
-
-    # Images
-    raw_imgs = [img.get("src") for img in soup.find_all("img", src=True)]
-    images = [_make_absolute(url, src) for src in raw_imgs if src]
-
-    # Headings
-    headings = {
-        "h1": _extract_text_from_tags(soup, "h1"),
-        "h2": _extract_text_from_tags(soup, "h2"),
-        "h3": _extract_text_from_tags(soup, "h3"),
-    }
-
-    return ScrapeResult(
-        url=url,
-        title=title,
-        meta_description=meta_description,
-        hyperlinks=hyperlinks,
-        images=images,
-        headings=headings,
-    )
+    return parser.parse_args(argv)
 
 
-# --------------------------------------------------------------------------- #
-# CLI entry point (optional)
-# --------------------------------------------------------------------------- #
-def _format_result(result: ScrapeResult) -> str:
-    """Pretty‑print the ScrapeResult for CLI use."""
-    lines = [
-        f"URL: {result.url}",
-        f"Title: {result.title or 'N/A'}",
-        f"Meta Description: {result.meta_description or 'N/A'}",
-        f"Hyperlinks ({len(result.hyperlinks)}):",
-    ]
-    lines.extend(f"  - {link}" for link in result.hyperlinks[:10])
-    if len(result.hyperlinks) > 10:
-        lines.append(f"  ... ({len(result.hyperlinks) - 10} more)")
+def _configure_logging(verbose: bool) -> None:
+    """
+    Adjust the log level based on *verbose* flag.
 
-    lines.append(f"Images ({len(result.images)}):")
-    lines.extend(f"  - {src}" for src in result.images[:10])
-    if len(result.images) > 10:
-        lines.append(f"  ... ({len(result.images) - 10} more)")
-
-    for level in ("h1", "h2", "h3"):
-        headings = result.headings.get(level, [])
-        lines.append(f"{level.upper()} ({len(headings)}):")
-        lines.extend(f"  - {txt}" for txt in headings[:10])
-        if len(headings) > 10:
-            lines.append(f"  ... ({len(headings) - 10} more)")
-
-    return "\n".join(lines)
+    Parameters
+    ----------
+    verbose: bool
+        If ``True``, set log level to DEBUG.
+    """
+    logger.setLevel(logging.DEBUG if verbose else logging.INFO)
 
 
-def main(argv: List[str] | None = None) -> None:
-    """Simple command‑line interface."""
-    if argv is None:
-        argv = sys.argv[1:]
+def main(argv: Optional[Iterable[str]] = None) -> None:
+    """
+    Entry point for command‑line usage.
 
-    if not argv:
-        print("Usage: python scraper.py <URL>", file=sys.stderr)
+    Parameters
+    ----------
+    argv: Optional[Iterable[str]]
+        Custom argument list; defaults to ``sys.argv[1:]``.
+    """
+    args = _parse_cli_args(argv)
+    _configure_logging(args.verbose)
+
+    try:
+        result = scrape_url(args.url)
+    except ScraperError as exc:
+        logger.error("Scraping failed: %s", exc)
         sys.exit(1)
 
-    url = argv[0]
-    try:
-        result = scrape_page(url)
-        print(_format_result(result))
-    except ValueError as ve:
-        logging.error("Invalid input: %s", ve)
-        sys.exit(2)
-    except requests.RequestException as re:
-        logging.error("Network error: %s", re)
-        sys.exit(3)
-    except Exception as e:  # pragma: no cover
-        logging.exception("Unexpected error: %s", e)
-        sys.exit(99)
+    # Pretty‑print the result
+    print("URL:", result.url)
+    print("Title:", result.title or "(none)")
+    print("Meta description:", result.meta_description or "(none)")
+    print("\nLinks:")
+    for link in result.links:
+        print("  -", link)
+    print("\nImages:")
+    for img in result.images:
+        print("  -", img)
+    print("\nHeadings:")
+    for level, texts in result.headings.items():
+        if texts:
+            print(f"  {level.upper()}:")
+            for txt in texts:
+                print("    -", txt)
 
 
 if __name__ == "__main__":

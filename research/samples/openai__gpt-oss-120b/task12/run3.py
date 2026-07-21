@@ -1,197 +1,269 @@
-#!/usr/bin/env python3
-"""
-File compression utility supporting ZIP, GZIP, and TAR formats.
+"""archive_util.py
+A small utility for creating and extracting archives.
+
+Supported formats:
+- ZIP (both files and directories)
+- GZIP (single file compression)
+- TAR (both plain tar and tar.gz)
 
 Features:
-- Compress single files or entire directories.
-- Decompress archives safely.
-- List archive contents.
+- Compress a single file.
+- Compress a directory (recursively).
+- Decompress an archive to a target directory.
+- List the contents of an archive.
 
-Usage (as a script):
-    python compress_util.py compress -f zip -o archive.zip /path/to/input
-    python compress_util.py decompress -d output_dir archive.zip
-    python compress_util.py list archive.tar.gz
+All operations raise :class:`ArchiveError` on failure.
+Security considerations:
+- Extraction checks for path traversal attempts and refuses to extract such entries.
+- Only paths inside the intended output directory are allowed.
 """
 
-import argparse
+from __future__ import annotations
+
 import gzip
 import os
-import shutil
-import sys
 import tarfile
 import zipfile
-from enum import Enum, auto
 from pathlib import Path
-from typing import List, Optional, Union
+from typing import List, Literal, Union
+
+__all__ = [
+    "ArchiveError",
+    "compress_file",
+    "compress_directory",
+    "decompress",
+    "list_contents",
+]
+
+ArchiveFormat = Literal["zip", "gzip", "tar"]
 
 
-class ArchiveFormat(Enum):
-    """Supported archive formats."""
-    ZIP = auto()
-    GZIP = auto()   # single file compression
-    TAR = auto()    # uncompressed tar
-    TAR_GZ = auto() # compressed tar (tar.gz)
+class ArchiveError(RuntimeError):
+    """Base exception for all archive‑related errors."""
 
 
-def _detect_format_from_extension(file_path: Path) -> Optional[ArchiveFormat]:
-    """Detect archive format based on file extension."""
-    ext = file_path.suffix.lower()
-    if ext == ".zip":
-        return ArchiveFormat.ZIP
-    if ext == ".gz" and file_path.suffixes[-2:] == [".tar", ".gz"]:
-        return ArchiveFormat.TAR_GZ
-    if ext == ".tar":
-        return ArchiveFormat.TAR
-    if ext == ".gz":
-        return ArchiveFormat.GZIP
-    return None
+def _validate_path(path: Path) -> None:
+    """Raise :class:`ArchiveError` if *path* does not exist or is not a file."""
+    if not path.exists():
+        raise ArchiveError(f"Path does not exist: {path}")
+    if not path.is_file():
+        raise ArchiveError(f"Path is not a file: {path}")
 
 
-def compress(
-    src: Union[str, Path],
-    dest: Union[str, Path],
-    fmt: ArchiveFormat,
+def _validate_dir(path: Path) -> None:
+    """Raise :class:`ArchiveError` if *path* does not exist or is not a directory."""
+    if not path.exists():
+        raise ArchiveError(f"Directory does not exist: {path}")
+    if not path.is_dir():
+        raise ArchiveError(f"Path is not a directory: {path}")
+
+
+def compress_file(
+    source: Union[str, Path],
+    destination: Union[str, Path],
+    fmt: ArchiveFormat = "zip",
 ) -> None:
     """
-    Compress a file or directory.
+    Compress a single file.
 
-    Args:
-        src: Path to source file or directory.
-        dest: Destination archive path.
-        fmt: Desired archive format.
+    Parameters
+    ----------
+    source : Path or str
+        Path to the file to compress.
+    destination : Path or str
+        Desired archive file path (extension may be omitted).
+    fmt : {"zip", "gzip", "tar"}
+        Archive format.
 
-    Raises:
-        FileNotFoundError: If source does not exist.
-        ValueError: If format is incompatible with source type.
-        OSError: For I/O related errors.
+    Raises
+    ------
+    ArchiveError
+        If the source file cannot be read or the archive cannot be written.
     """
-    src_path = Path(src).resolve()
-    dest_path = Path(dest).resolve()
+    src = Path(source).resolve()
+    dst = Path(destination).resolve()
+    _validate_path(src)
 
-    if not src_path.exists():
-        raise FileNotFoundError(f"Source path does not exist: {src_path}")
+    if fmt == "gzip":
+        if dst.suffix != ".gz":
+            dst = dst.with_suffix(dst.suffix + ".gz")
+        try:
+            with src.open("rb") as f_in, gzip.open(dst, "wb") as f_out:
+                f_out.writelines(f_in)
+        except OSError as exc:
+            raise ArchiveError(f"GZIP compression failed: {exc}") from exc
 
-    try:
-        if fmt == ArchiveFormat.GZIP:
-            if not src_path.is_file():
-                raise ValueError("GZIP format only supports single file compression.")
-            with src_path.open("rb") as f_in, gzip.open(dest_path, "wb") as f_out:
-                shutil.copyfileobj(f_in, f_out)
+    elif fmt == "zip":
+        if dst.suffix != ".zip":
+            dst = dst.with_suffix(".zip")
+        try:
+            with zipfile.ZipFile(dst, "w", compression=zipfile.ZIP_DEFLATED) as zf:
+                zf.write(src, arcname=src.name)
+        except OSError as exc:
+            raise ArchiveError(f"ZIP compression failed: {exc}") from exc
 
-        elif fmt == ArchiveFormat.ZIP:
-            with zipfile.ZipFile(dest_path, mode="w", compression=zipfile.ZIP_DEFLATED) as zf:
-                if src_path.is_file():
-                    zf.write(src_path, arcname=src_path.name)
-                else:
-                    for file in src_path.rglob("*"):
-                        if file.is_file():
-                            arcname = file.relative_to(src_path.parent)
-                            zf.write(file, arcname=str(arcname))
+    elif fmt == "tar":
+        if dst.suffix not in {".tar", ".tgz", ".tar.gz"}:
+            dst = dst.with_suffix(".tar")
+        try:
+            mode = "w:gz" if dst.suffix in {".tgz", ".gz"} else "w"
+            with tarfile.open(dst, mode) as tf:
+                tf.add(src, arcname=src.name)
+        except OSError as exc:
+            raise ArchiveError(f"TAR compression failed: {exc}") from exc
 
-        elif fmt in (ArchiveFormat.TAR, ArchiveFormat.TAR_GZ):
-            mode = "w:gz" if fmt == ArchiveFormat.TAR_GZ else "w"
-            with tarfile.open(dest_path, mode=mode) as tf:
-                tf.add(src_path, arcname=src_path.name, recursive=True)
+    else:
+        raise ArchiveError(f"Unsupported format: {fmt}")
 
-        else:
-            raise ValueError(f"Unsupported format: {fmt}")
 
-    except OSError as exc:
-        raise OSError(f"Error during compression: {exc}") from exc
+def compress_directory(
+    source_dir: Union[str, Path],
+    destination: Union[str, Path],
+    fmt: ArchiveFormat = "zip",
+) -> None:
+    """
+    Compress an entire directory (recursively).
+
+    Parameters
+    ----------
+    source_dir : Path or str
+        Directory to compress.
+    destination : Path or str
+        Desired archive file path (extension may be omitted).
+    fmt : {"zip", "tar"}
+        Archive format. ``gzip`` is not applicable to directories.
+
+    Raises
+    ------
+    ArchiveError
+        If the source directory cannot be read or the archive cannot be written.
+    """
+    src_dir = Path(source_dir).resolve()
+    dst = Path(destination).resolve()
+    _validate_dir(src_dir)
+
+    if fmt == "gzip":
+        raise ArchiveError("GZIP format supports only single file compression, not directories.")
+
+    if fmt == "zip":
+        if dst.suffix != ".zip":
+            dst = dst.with_suffix(".zip")
+        try:
+            with zipfile.ZipFile(dst, "w", compression=zipfile.ZIP_DEFLATED) as zf:
+                for file_path in src_dir.rglob("*"):
+                    if file_path.is_file():
+                        arcname = file_path.relative_to(src_dir)
+                        zf.write(file_path, arcname=str(arcname))
+        except OSError as exc:
+            raise ArchiveError(f"ZIP compression failed: {exc}") from exc
+
+    elif fmt == "tar":
+        if dst.suffix not in {".tar", ".tgz", ".tar.gz"}:
+            dst = dst.with_suffix(".tar")
+        try:
+            mode = "w:gz" if dst.suffix in {".tgz", ".gz"} else "w"
+            with tarfile.open(dst, mode) as tf:
+                tf.add(src_dir, arcname=src_dir.name)
+        except OSError as exc:
+            raise ArchiveError(f"TAR compression failed: {exc}") from exc
+
+    else:
+        raise ArchiveError(f"Unsupported format: {fmt}")
 
 
 def _is_within_directory(directory: Path, target: Path) -> bool:
-    """Check that target is inside directory to prevent path traversal."""
+    """Return True if *target* resolves to a location inside *directory*."""
     try:
         directory = directory.resolve()
         target = target.resolve()
-        return str(target).startswith(str(directory))
+        return str(target).startswith(str(directory) + os.sep)
     except Exception:
         return False
 
 
-def _safe_extract_tar(tar: tarfile.TarFile, path: Path) -> None:
-    """Extract tar safely, preventing path traversal attacks."""
-    for member in tar.getmembers():
-        member_path = path / member.name
-        if not _is_within_directory(path, member_path):
-            raise Exception(f"Attempted Path Traversal in Tar File: {member.name}")
-    tar.extractall(path)
-
-
 def decompress(
-    archive: Union[str, Path],
-    dest_dir: Union[str, Path],
+    archive_path: Union[str, Path],
+    output_dir: Union[str, Path],
 ) -> None:
     """
-    Decompress an archive to a destination directory.
+    Extract an archive to a directory.
 
-    Args:
-        archive: Path to the archive file.
-        dest_dir: Directory where contents will be extracted.
+    Parameters
+    ----------
+    archive_path : Path or str
+        Path to the archive file.
+    output_dir : Path or str
+        Destination directory for extracted files.
 
-    Raises:
-        FileNotFoundError: If archive does not exist.
-        ValueError: If format is unsupported.
-        OSError: For I/O errors.
+    Raises
+    ------
+    ArchiveError
+        If extraction fails or a security check is violated.
     """
-    archive_path = Path(archive).resolve()
-    dest_path = Path(dest_dir).resolve()
-    dest_path.mkdir(parents=True, exist_ok=True)
+    archive = Path(archive_path).resolve()
+    out_dir = Path(output_dir).resolve()
+    if not archive.is_file():
+        raise ArchiveError(f"Archive not found: {archive}")
 
-    if not archive_path.is_file():
-        raise FileNotFoundError(f"Archive not found: {archive_path}")
+    out_dir.mkdir(parents=True, exist_ok=True)
 
-    fmt = _detect_format_from_extension(archive_path)
-    if fmt is None:
-        raise ValueError(f"Could not determine archive format for: {archive_path}")
+    # ZIP handling
+    if zipfile.is_zipfile(archive):
+        try:
+            with zipfile.ZipFile(archive, "r") as zf:
+                for member in zf.infolist():
+                    member_path = out_dir / member.filename
+                    if not _is_within_directory(out_dir, member_path):
+                        raise ArchiveError(f"Path traversal attempt detected in ZIP entry: {member.filename}")
+                zf.extractall(out_dir)
+        except (zipfile.BadZipFile, OSError) as exc:
+            raise ArchiveError(f"Failed to extract ZIP archive: {exc}") from exc
+        return
+
+    # TAR handling (including gzipped tar)
+    try:
+        with tarfile.open(archive, "r:*") as tf:
+            for member in tf.getmembers():
+                member_path = out_dir / member.name
+                if not _is_within_directory(out_dir, member_path):
+                    raise ArchiveError(f"Path traversal attempt detected in TAR entry: {member.name}")
+            tf.extractall(out_dir)
+    except (tarfile.TarError, OSError) as exc:
+        raise ArchiveError(f"Failed to extract TAR archive: {exc}") from exc
+
+
+def list_contents(archive_path: Union[str, Path]) -> List[str]:
+    """
+    Return a list of file names contained in an archive.
+
+    Parameters
+    ----------
+    archive_path : Path or str
+        Path to the archive file.
+
+    Returns
+    -------
+    List[str]
+        Paths of members inside the archive, as stored (relative) names.
+
+    Raises
+    ------
+    ArchiveError
+        If the archive cannot be read.
+    """
+    archive = Path(archive_path).resolve()
+    if not archive.is_file():
+        raise ArchiveError(f"Archive not found: {archive}")
+
+    if zipfile.is_zipfile(archive):
+        try:
+            with zipfile.ZipFile(archive, "r") as zf:
+                return zf.namelist()
+        except (zipfile.BadZipFile, OSError) as exc:
+            raise ArchiveError(f"Failed to read ZIP archive: {exc}") from exc
 
     try:
-        if fmt == ArchiveFormat.GZIP:
-            # GZIP is a single file; decompress to dest_dir keeping original name
-            out_name = archive_path.with_suffix("").name
-            out_path = dest_path / out_name
-            with gzip.open(archive_path, "rb") as f_in, out_path.open("wb") as f_out:
-                shutil.copyfileobj(f_in, f_out)
-
-        elif fmt == ArchiveFormat.ZIP:
-            with zipfile.ZipFile(archive_path, "r") as zf:
-                for member in zf.infolist():
-                    member_path = dest_path / member.filename
-                    if not _is_within_directory(dest_path, member_path):
-                        raise Exception(f"Path traversal attempt in ZIP: {member.filename}")
-                zf.extractall(dest_path)
-
-        elif fmt in (ArchiveFormat.TAR, ArchiveFormat.TAR_GZ):
-            mode = "r:gz" if fmt == ArchiveFormat.TAR_GZ else "r"
-            with tarfile.open(archive_path, mode) as tf:
-                _safe_extract_tar(tf, dest_path)
-
-        else:
-            raise ValueError(f"Unsupported format: {fmt}")
-
-    except OSError as exc:
-        raise OSError(f"Error during decompression: {exc}") from exc
-
-
-def list_contents(archive: Union[str, Path]) -> List[str]:
-    """
-    List the contents of an archive.
-
-    Args:
-        archive: Path to the archive file.
-
-    Returns:
-        List of file paths within the archive.
-
-    Raises:
-        FileNotFoundError: If archive does not exist.
-        ValueError: If format is unsupported.
-        OSError: For I/O errors.
-    """
-    archive_path = Path(archive).resolve()
-    if not archive_path.is_file():
-        raise FileNotFoundError(f"Archive not found: {archive_path}")
-
-    fmt = _detect_format_from_extension(archive_path)
-    if
+        with tarfile.open(archive, "r:*") as tf:
+            return [member.name for member in tf.getmembers()]
+    except (tarfile.TarError, OSError) as exc:
+        raise ArchiveError(f"Failed to read TAR archive: {exc}") from exc

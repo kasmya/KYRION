@@ -1,298 +1,277 @@
+"""flask_auth.py
+A minimal Flask authentication module implementing user registration, login,
+logout, password hashing with bcrypt, and session management using JWT
+stored in HttpOnly cookies.
+
+The module is self‑contained for demonstration purposes; in production,
+replace the in‑memory user store with a persistent database and configure
+secure cookie attributes.
 """
-A simple Flask-based authentication system with:
-- User registration
-- Password hashing (bcrypt)
-- Session management via Flask signed cookies
-- Login & logout endpoints
-- Type hints, docstrings and error handling
-"""
+
+from __future__ import annotations
 
 import os
-import sqlite3
-from datetime import datetime, timedelta
-from typing import Optional, Tuple
+import datetime
+from typing import Dict, Optional
 
+from flask import Flask, request, jsonify, make_response, g
 import bcrypt
-from flask import (
-    Flask,
-    abort,
-    flash,
-    g,
-    jsonify,
-    redirect,
-    render_template,
-    request,
-    session,
-    url_for,
-)
+import jwt
 
-# ----------------------------------------------------------------------
+# --------------------------------------------------------------------------- #
 # Configuration
-# ----------------------------------------------------------------------
-DATABASE = os.getenv("FLASK_AUTH_DB", "auth.db")
-SECRET_KEY = os.getenv("FLASK_SECRET_KEY", os.urandom(32).hex())
-SESSION_COOKIE_HTTPONLY = True
-SESSION_COOKIE_SAMESITE = "Lax"
-PERMANENT_SESSION_LIFETIME = timedelta(days=7)
+# --------------------------------------------------------------------------- #
 
+# Secret key for JWT signing – should be set in environment for production.
+JWT_SECRET = os.getenv("JWT_SECRET", "change_this_secret_key")
+JWT_ALGORITHM = "HS256"
+JWT_EXP_DELTA_SECONDS = 3600  # 1 hour token validity
 
-def get_db() -> sqlite3.Connection:
-    """Open a new database connection if there is none yet for the current app context."""
-    if "db" not in g:
-        conn = sqlite3.connect(DATABASE, detect_types=sqlite3.PARSE_DECLTYPES)
-        conn.row_factory = sqlite3.Row
-        g.db = conn
-    return g.db
-
-
-def close_db(e: Optional[BaseException] = None) -> None:
-    """Close the database connection if it exists."""
-    db = g.pop("db", None)
-    if db is not None:
-        db.close()
-
-
-def init_db() -> None:
-    """Create the users table if it does not exist."""
-    db = get_db()
-    db.execute(
-        """
-        CREATE TABLE IF NOT EXISTS users (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
-            username TEXT UNIQUE NOT NULL,
-            password_hash BLOB NOT NULL,
-            created_at TIMESTAMP NOT NULL
-        )
-        """
-    )
-    db.commit()
-
-
-# ----------------------------------------------------------------------
-# Flask App
-# ----------------------------------------------------------------------
+# Flask app initialization
 app = Flask(__name__)
-app.secret_key = SECRET_KEY
-app.config.update(
-    SESSION_COOKIE_HTTPONLY=SESSION_COOKIE_HTTPONLY,
-    SESSION_COOKIE_SAMESITE=SESSION_COOKIE_SAMESITE,
-    PERMANENT_SESSION_LIFETIME=PERMANENT_SESSION_LIFETIME,
-)
-
-app.teardown_appcontext(close_db)
+app.config["JSONIFY_PRETTYPRINT_REGULAR"] = False
 
 
-# ----------------------------------------------------------------------
-# Helper Functions
-# ----------------------------------------------------------------------
+# --------------------------------------------------------------------------- #
+# User store (in‑memory for demo)
+# --------------------------------------------------------------------------- #
+
+class UserStore:
+    """Thread‑safe in‑memory store for user credentials."""
+
+    def __init__(self) -> None:
+        self._users: Dict[str, bytes] = {}
+
+    def add_user(self, username: str, password_hash: bytes) -> None:
+        """Add a new user. Raises ValueError if the username already exists."""
+        if username in self._users:
+            raise ValueError("User already exists.")
+        self._users[username] = password_hash
+
+    def get_password_hash(self, username: str) -> Optional[bytes]:
+        """Retrieve the stored password hash for a user, or None if not found."""
+        return self._users.get(username)
+
+    def verify_credentials(self, username: str, password: str) -> bool:
+        """Check if supplied credentials are valid."""
+        stored_hash = self.get_password_hash(username)
+        if stored_hash is None:
+            return False
+        return bcrypt.checkpw(password.encode("utf-8"), stored_hash)
+
+
+_user_store = UserStore()
+
+
+# --------------------------------------------------------------------------- #
+# Helper functions
+# --------------------------------------------------------------------------- #
+
 def hash_password(password: str) -> bytes:
     """
-    Hash a password using bcrypt.
+    Hash a plaintext password using bcrypt.
 
     Args:
-        password: The plain text password.
+        password: The plaintext password.
 
     Returns:
-        The bcrypt hash.
+        The bcrypt hash as bytes.
+
+    Raises:
+        ValueError: If the password is empty.
     """
-    return bcrypt.hashpw(password.encode("utf-8"), bcrypt.gensalt())
+    if not password:
+        raise ValueError("Password must not be empty.")
+    salt = bcrypt.gensalt()
+    return bcrypt.hashpw(password.encode("utf-8"), salt)
 
 
-def verify_password(password: str, hashed: bytes) -> bool:
+def create_jwt_token(username: str) -> str:
     """
-    Verify a password against an existing hash.
+    Create a signed JWT token containing the username and expiration.
 
     Args:
-        password: The plain text password.
-        hashed: The stored bcrypt hash.
+        username: The authenticated user's name.
 
     Returns:
-        True if the password matches, False otherwise.
+        A JWT token as a string.
     """
-    return bcrypt.checkpw(password.encode("utf-8"), hashed)
+    exp = datetime.datetime.utcnow() + datetime.timedelta(seconds=JWT_EXP_DELTA_SECONDS)
+    payload = {"sub": username, "exp": exp}
+    token = jwt.encode(payload, JWT_SECRET, algorithm=JWT_ALGORITHM)
+    # PyJWT returns str in recent versions; ensure str.
+    return token if isinstance(token, str) else token.decode("utf-8")
 
 
-def get_user_by_username(username: str) -> Optional[sqlite3.Row]:
+def decode_jwt_token(token: str) -> Dict[str, str]:
     """
-    Retrieve a user row by username.
+    Decode and verify a JWT token.
 
     Args:
-        username: The username to look up.
+        token: The JWT token string.
 
     Returns:
-        A row object or None if not found.
+        The token payload.
+
+    Raises:
+        jwt.ExpiredSignatureError: If the token has expired.
+        jwt.InvalidTokenError: If the token is otherwise invalid.
     """
-    db = get_db()
-    cur = db.execute("SELECT * FROM users WHERE username = ?", (username,))
-    return cur.fetchone()
+    return jwt.decode(token, JWT_SECRET, algorithms=[JWT_ALGORITHM])
 
 
-def create_user(username: str, password: str) -> Tuple[bool, str]:
+def set_jwt_cookie(response, token: str) -> None:
     """
-    Register a new user.
+    Attach the JWT token to the response as an HttpOnly, Secure cookie.
 
     Args:
-        username: Desired username.
-        password: Plain text password.
-
-    Returns:
-        (success, message) tuple.
+        response: The Flask response object.
+        token: The JWT token string.
     """
-    if get_user_by_username(username):
-        return False, "Username already taken."
-
-    password_hash = hash_password(password)
-    db = get_db()
-    try:
-        db.execute(
-            "INSERT INTO users (username, password_hash, created_at) VALUES (?, ?, ?)",
-            (username, password_hash, datetime.utcnow()),
-        )
-        db.commit()
-        return True, "User created successfully."
-    except sqlite3.IntegrityError:
-        return False, "Failed to create user due to database error."
+    response.set_cookie(
+        "access_token",
+        token,
+        httponly=True,
+        secure=False,  # Set to True when serving over HTTPS
+        samesite="Lax",
+        max_age=JWT_EXP_DELTA_SECONDS,
+    )
 
 
-def login_user(user_id: int) -> None:
-    """Log the user in by storing their ID in the session."""
-    session.clear()
-    session["user_id"] = user_id
-    session.permanent = True  # use PERMANENT_SESSION_LIFETIME
+def clear_jwt_cookie(response) -> None:
+    """Remove the JWT cookie from the client."""
+    response.delete_cookie("access_token")
 
 
-def logout_user() -> None:
-    """Log the current user out."""
-    session.clear()
+def get_token_from_request() -> Optional[str]:
+    """Extract JWT token from the request cookies."""
+    return request.cookies.get("access_token")
 
 
-def current_user() -> Optional[sqlite3.Row]:
-    """Return the currently logged‑in user, or None."""
-    user_id = session.get("user_id")
-    if not user_id:
-        return None
-    db = get_db()
-    cur = db.execute("SELECT * FROM users WHERE id = ?", (user_id,))
-    return cur.fetchone()
+def login_required(func):
+    """
+    Flask view decorator that ensures a valid JWT token is present.
+    The username is stored in Flask's `g` context variable.
+    """
+    from functools import wraps
 
-
-def login_required(view_func):
-    """Simple decorator that redirects unauthenticated users to login."""
-
+    @wraps(func)
     def wrapper(*args, **kwargs):
-        if current_user() is None:
-            return redirect(url_for("login", next=request.path))
-        return view_func(*args, **kwargs)
+        token = get_token_from_request()
+        if not token:
+            return jsonify({"error": "Authentication token required."}), 401
+        try:
+            payload = decode_jwt_token(token)
+            g.current_user = payload["sub"]
+        except jwt.ExpiredSignatureError:
+            return jsonify({"error": "Token has expired."}), 401
+        except jwt.InvalidTokenError:
+            return jsonify({"error": "Invalid token."}), 401
+        return func(*args, **kwargs)
 
-    wrapper.__name__ = view_func.__name__
     return wrapper
 
 
-# ----------------------------------------------------------------------
-# Routes
-# ----------------------------------------------------------------------
-@app.route("/")
-def index() -> str:
-    if user := current_user():
-        return f"Hello, {user['username']}! <a href='{url_for('logout')}'>Logout</a>"
-    return "Welcome! <a href='/login'>Login</a> or <a href='/register'>Register</a>"
+# --------------------------------------------------------------------------- #
+# Flask routes
+# --------------------------------------------------------------------------- #
+
+@app.route("/register", methods=["POST"])
+def register() -> "flask.Response":
+    """
+    Register a new user.
+
+    Expected JSON payload:
+        {
+            "username": "user",
+            "password": "secret"
+        }
+
+    Returns:
+        JSON response with success message or error details.
+    """
+    data = request.get_json(silent=True) or {}
+    username = data.get("username")
+    password = data.get("password")
+
+    if not username or not password:
+        return jsonify({"error": "Username and password are required."}), 400
+
+    try:
+        password_hash = hash_password(password)
+        _user_store.add_user(username, password_hash)
+    except ValueError as ve:
+        return jsonify({"error": str(ve)}), 400
+    except Exception as exc:
+        return jsonify({"error": "Registration failed.", "details": str(exc)}), 500
+
+    return jsonify({"message": "User registered successfully."}), 201
 
 
-@app.route("/register", methods=["GET", "POST"])
-def register() -> str:
-    if request.method == "POST":
-        username = request.form.get("username", "").strip()
-        password = request.form.get("password", "")
-        confirm = request.form.get("confirm", "")
+@app.route("/login", methods=["POST"])
+def login() -> "flask.Response":
+    """
+    Authenticate a user and issue a JWT token.
 
-        # Basic validation
-        if not username or not password:
-            flash("Username and password are required.", "danger")
-        elif password != confirm:
-            flash("Passwords do not match.", "danger")
-        else:
-            success, message = create_user(username, password)
-            flash(message, "success" if success else "danger")
-            if success:
-                return redirect(url_for("login"))
+    Expected JSON payload:
+        {
+            "username": "user",
+            "password": "secret"
+        }
 
-    return render_template("register.html")
+    Returns:
+        JSON response with success message and sets JWT cookie.
+    """
+    data = request.get_json(silent=True) or {}
+    username = data.get("username")
+    password = data.get("password")
 
+    if not username or not password:
+        return jsonify({"error": "Username and password are required."}), 400
 
-@app.route("/login", methods=["GET", "POST"])
-def login() -> str:
-    if request.method == "POST":
-        username = request.form.get("username", "").strip()
-        password = request.form.get("password", "")
+    try:
+        if not _user_store.verify_credentials(username, password):
+            raise ValueError("Invalid credentials.")
+        token = create_jwt_token(username)
+    except ValueError as ve:
+        return jsonify({"error": str(ve)}), 401
+    except Exception as exc:
+        return jsonify({"error": "Login failed.", "details": str(exc)}), 500
 
-        user = get_user_by_username(username)
-        if user and verify_password(password, user["password_hash"]):
-            login_user(user["id"])
-            flash("Logged in successfully.", "success")
-            next_url = request.args.get("next") or url_for("index")
-            return redirect(next_url)
-        flash("Invalid username or password.", "danger")
-
-    return render_template("login.html")
+    response = jsonify({"message": "Login successful."})
+    set_jwt_cookie(response, token)
+    return response, 200
 
 
-@app.route("/logout")
-def logout() -> str:
-    logout_user()
-    flash("You have been logged out.", "info")
-    return redirect(url_for("index"))
+@app.route("/logout", methods=["POST"])
+def logout() -> "flask.Response":
+    """
+    Log out the current user by clearing the JWT cookie.
+
+    Returns:
+        JSON response confirming logout.
+    """
+    response = jsonify({"message": "Logged out successfully."})
+    clear_jwt_cookie(response)
+    return response, 200
 
 
-@app.route("/protected")
+@app.route("/protected", methods=["GET"])
 @login_required
-def protected() -> str:
-    user = current_user()
-    return f"This is a protected page. Hello, {user['username']}!"
+def protected() -> "flask.Response":
+    """
+    Example protected endpoint that requires authentication.
+
+    Returns:
+        JSON response containing the current username.
+    """
+    return jsonify({"message": f"Hello, {g.current_user}! This is a protected resource."}), 200
 
 
-# ----------------------------------------------------------------------
-# Template Strings (for demo purposes; in production use separate files)
-# ----------------------------------------------------------------------
-app.jinja_loader = dict(
-    register="""
-<!doctype html>
-<title>Register</title>
-<h2>Register</h2>
-{% with messages = get_flashed_messages(with_categories=true) %}
-  {% for category, msg in messages %}
-    <p class="flash {{ category }}">{{ msg }}</p>
-  {% endfor %}
-{% endwith %}
-<form method=post>
-  <label>Username: <input name=username required></label><br>
-  <label>Password: <input type=password name=password required></label><br>
-  <label>Confirm: <input type=password name=confirm required></label><br>
-  <button type=submit>Register</button>
-</form>
-<a href="{{ url_for('login') }}">Already have an account? Login</a>
-""",
-    login="""
-<!doctype html>
-<title>Login</title>
-<h2>Login</h2>
-{% with messages = get_flashed_messages(with_categories=true) %}
-  {% for category, msg in messages %}
-    <p class="flash {{ category }}">{{ msg }}</p>
-  {% endfor %}
-{% endwith %}
-<form method=post>
-  <label>Username: <input name=username required></label><br>
-  <label>Password: <input type=password name=password required></label><br>
-  <button type=submit>Login</button>
-</form>
-<a href="{{ url_for('register') }}">Don’t have an account? Register</a>
-""",
-)
-
-# ----------------------------------------------------------------------
+# --------------------------------------------------------------------------- #
 # Application entry point
-# ----------------------------------------------------------------------
+# --------------------------------------------------------------------------- #
+
 if __name__ == "__main__":
-    init_db()
-    # In production use a real WSGI server and enforce HTTPS.
-    app.run(host="0.0.0.0", port=5000, debug=False)
+    # For development only; use a production-ready server in real deployments.
+    app.run(host="127.0.0.1", port=5000, debug=False)

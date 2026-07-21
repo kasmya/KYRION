@@ -1,323 +1,303 @@
 """
-Chatbot implementation with intent recognition, response generation,
-conversation history, and fallback handling.
+chatbot.py
+~~~~~~~~~~
 
-Features:
-- Zero-shot intent classification using Hugging Face transformers.
-- Rule‑based responses for known intents.
-- Generative fallback using a language model (e.g., GPT‑2).
-- Conversation history tracking.
-- Input sanitisation and length limits for security.
+A lightweight, rule‑based chatbot implementation suitable for inclusion in
+small projects or as a teaching example.  Features:
+
+* Intent recognition using regular expressions.
+* Simple response generation with optional placeholders.
+* Conversation history tracking (timestamped user ↔ bot exchanges).
+* Graceful fallback when no intent matches.
+* Full type hints, comprehensive docstrings, and explicit error handling.
+
+Only the Python standard library is required.
 """
 
 from __future__ import annotations
 
+import datetime
 import logging
-import random
 import re
-import sys
-import string
-from typing import Any, Dict, List, Tuple
-
-from transformers import pipeline, Pipeline, set_seed
-from transformers.pipelines.base import PipelineException
+import threading
+from dataclasses import dataclass, field
+from typing import Callable, Dict, List, Optional, Pattern, Tuple
 
 # --------------------------------------------------------------------------- #
-# Configuration constants
+# Logging configuration (security‑aware: no sensitive data is logged)
 # --------------------------------------------------------------------------- #
-MAX_INPUT_LENGTH: int = 500          # characters
-MAX_RESPONSE_TOKENS: int = 150        # tokens for generative fallback
-RANDOM_SEED: int = 42                # reproducibility
-DEVICE: int = -1                     # -1 = CPU, >=0 GPU id
+logger = logging.getLogger(__name__)
+if not logger.handlers:
+    handler = logging.StreamHandler()
+    formatter = logging.Formatter(
+        fmt="%(asctime)s - %(levelname)s - %(name)s - %(message)s"
+    )
+    handler.setFormatter(formatter)
+    logger.addHandler(handler)
+    logger.setLevel(logging.INFO)
 
-INTENT_LABELS: List[str] = [
-    "greeting",
-    "goodbye",
-    "weather",
-    "joke",
-    "thank_you",
-    "unknown",
-]
-
-# Predefined responses for recognized intents
-PREDEFINED_RESPONSES: Dict[str, List[str]] = {
-    "greeting": [
-        "Hello! How can I help you today?",
-        "Hi there! What would you like to talk about?",
-        "Hey! How's it going?",
-    ],
-    "goodbye": [
-        "Goodbye! Have a great day!",
-        "See you later! Take care!",
-        "Farewell! Come back anytime.",
-    ],
-    "weather": [
-        "I hope the weather is nice where you are!",
-        "It's always good to check the forecast before heading out.",
-    ],
-    "joke": [
-        "Why did the scarecrow win an award? Because he was outstanding in his field!",
-        "I would tell you a construction joke, but I'm still working on it.",
-    ],
-    "thank_you": [
-        "You're welcome!",
-        "No problem at all!",
-        "Glad I could help!",
-    ],
-}
-
-FALLBACK_RESPONSES: List[str] = [
-    "I'm not sure I understand. Could you rephrase?",
-    "Sorry, I didn't catch that. Can you elaborate?",
-    "I'm still learning. Can you give me more details?",
-]
 
 # --------------------------------------------------------------------------- #
-# Utility functions
+# Data structures
 # --------------------------------------------------------------------------- #
-
-
-def _clean_text(text: str) -> str:
-    """
-    Remove non‑printable characters and truncate to the max allowed length.
-    """
-    # Strip control characters and trim whitespace
-    printable = set(string.printable)
-    cleaned = "".join(ch for ch in text if ch in printable).strip()
-    # Truncate to length limit
-    if len(cleaned) > MAX_INPUT_LENGTH:
-        cleaned = cleaned[:MAX_INPUT_LENGTH]
-    return cleaned
-
-
-def _log_error(msg: str, exc: BaseException | None = None) -> None:
-    """Log errors consistently."""
-    if exc:
-        logging.error("%s: %s", msg, exc, exc_info=True)
-    else:
-        logging.error(msg)
+@dataclass
+class MessageRecord:
+    """A single exchange entry in the conversation history."""
+    timestamp: datetime.datetime
+    user_message: str
+    bot_message: str
 
 
 # --------------------------------------------------------------------------- #
 # Core chatbot class
 # --------------------------------------------------------------------------- #
-
-
 class ChatBot:
     """
-    A simple chatbot supporting intent recognition, rule‑based and generative
-    responses, and conversation history.
+    Rule‑based chatbot with intent recognition, response generation,
+    and conversation history.
+
+    Parameters
+    ----------
+    intents : Optional[Dict[str, Dict[str, Any]]]
+        Mapping of intent names to a dictionary containing:
+        * ``patterns`` – list of regex strings to match the intent.
+        * ``responses`` – list of possible response templates.
+        If omitted, a default set of intents is used.
+    fallback_response : str
+        Message returned when no intent matches. Defaults to a polite generic reply.
     """
+
+    _DEFAULT_INTENTS: Dict[str, Dict[str, List[str]]] = {
+        "greeting": {
+            "patterns": [r"\bhi\b", r"\bhello\b", r"\bhey\b", r"\bgood (morning|afternoon|evening)\b"],
+            "responses": ["Hello! How can I assist you today?", "Hi there! What can I do for you?"],
+        },
+        "farewell": {
+            "patterns": [r"\bbye\b", r"\bgoodbye\b", r"\bsee you\b", r"\btake care\b"],
+            "responses": ["Goodbye! Have a great day.", "See you later!"],
+        },
+        "thanks": {
+            "patterns": [r"\bthanks\b", r"\bthank you\b", r"\bthx\b"],
+            "responses": ["You're welcome!", "Happy to help!"],
+        },
+        "time_query": {
+            "patterns": [r"\bwhat time\b", r"\bcurrent time\b", r"\btime now\b"],
+            "responses": ["The current time is {time}."],
+        },
+    }
 
     def __init__(
         self,
-        intent_labels: List[str] | None = None,
-        fallback_model_name: str = "gpt2",
-        device: int = DEVICE,
+        intents: Optional[Dict[str, Dict[str, List[str]]]] = None,
+        fallback_response: str = "I'm not sure how to respond to that. Could you rephrase?",
     ) -> None:
-        """
-        Initialise pipelines for intent classification and response generation.
-
-        Args:
-            intent_labels: List of candidate intent strings.
-            fallback_model_name: Name of a generative model for fallback.
-            device: Device identifier for transformers (-1 for CPU).
-        """
-        self.logger = logging.getLogger(self.__class__.__name__)
-        self.intent_labels = intent_labels or INTENT_LABELS
-        self.history: List[Dict[str, str]] = []
-
-        # Zero‑shot classification pipeline for intent recognition
-        try:
-            self.intent_classifier: Pipeline = pipeline(
-                "zero-shot-classification",
-                model="facebook/bart-large-mnli",
-                device=device,
-            )
-        except Exception as exc:
-            _log_error("Failed to initialise intent classifier pipeline", exc)
-            raise RuntimeError("Intent classifier initialisation failed") from exc
-
-        # Text‑generation pipeline for fallback responses
-        try:
-            self.generator: Pipeline = pipeline(
-                "text-generation",
-                model=fallback_model_name,
-                device=device,
-                framework="pt",
-            )
-            set_seed(RANDOM_SEED)
-        except Exception as exc:
-            _log_error("Failed to initialise text generation pipeline", exc)
-            raise RuntimeError("Response generator initialisation failed") from exc
-
-        self.logger.info("ChatBot initialised with intents: %s", self.intent_labels)
+        self._intents = intents or self._DEFAULT_INTENTS
+        self._fallback_response = fallback_response
+        self._compiled_patterns: Dict[str, List[Pattern[str]]] = self._compile_intent_patterns()
+        self._history: List[MessageRecord] = []
+        self._history_lock = threading.Lock()
+        logger.info("ChatBot initialized with %d intent(s).", len(self._intents))
 
     # --------------------------------------------------------------------- #
-    # History handling
+    # Private helpers
     # --------------------------------------------------------------------- #
-
-    def add_to_history(self, role: str, content: str) -> None:
+    def _compile_intent_patterns(self) -> Dict[str, List[Pattern[str]]]:
         """
-        Append a message to the conversation history.
+        Compile regex patterns for all intents.
 
-        Args:
-            role: Either "user" or "assistant".
-            content: Message text.
+        Returns
+        -------
+        Dict[str, List[Pattern[str]]]
+            Mapping from intent name to compiled regex objects.
         """
-        self.history.append({"role": role, "content": content})
+        compiled: Dict[str, List[Pattern[str]]] = {}
+        for intent, data in self._intents.items():
+            try:
+                compiled[intent] = [re.compile(p, re.IGNORECASE) for p in data["patterns"]]
+            except re.error as exc:
+                logger.error("Invalid regex pattern for intent '%s': %s", intent, exc)
+                raise ValueError(f"Invalid regex pattern for intent '{intent}'.") from exc
+        return compiled
 
-    def get_history(self) -> List[Dict[str, str]]:
-        """Return a copy of the conversation history."""
-        return list(self.history)
-
-    # --------------------------------------------------------------------- #
-    # Intent recognition
-    # --------------------------------------------------------------------- #
-
-    def recognize_intent(self, text: str) -> Tuple[str, float]:
+    def _recognize_intent(self, message: str) -> Optional[str]:
         """
-        Determine the most likely intent for the given text.
+        Identify the intent of a user message.
 
-        Returns:
-            A tuple of (intent_label, confidence_score). If the confidence is
-            below a threshold, "unknown" is returned.
+        Parameters
+        ----------
+        message : str
+            The raw user input.
+
+        Returns
+        -------
+        Optional[str]
+            The name of the matching intent, or ``None`` if no match is found.
         """
-        try:
-            result = self.intent_classifier(
-                sequences=text,
-                candidate_labels=self.intent_labels,
-                multi_label=False,
-            )
-            top_label: str = result["labels"][0]
-            score: float = float(result["scores"][0])
-            # Treat low confidence as unknown intent
-            if score < 0.4 or top_label == "unknown":
-                return "unknown", score
-            return top_label, score
-        except PipelineException as exc:
-            _log_error("Intent classification pipeline error", exc)
-            return "unknown", 0.0
-        except Exception as exc:
-            _log_error("Unexpected error during intent recognition", exc)
-            return "unknown", 0.0
-
-    # --------------------------------------------------------------------- #
-    # Response generation
-    # --------------------------------------------------------------------- #
-
-    def _rule_based_response(self, intent: str) -> str | None:
-        """Select a predefined response for a known intent, if available."""
-        responses = PREDEFINED_RESPONSES.get(intent)
-        if responses:
-            return random.choice(responses)
+        for intent, patterns in self._compiled_patterns.items():
+            for pattern in patterns:
+                if pattern.search(message):
+                    logger.debug("Message matched intent '%s' with pattern '%s'.", intent, pattern.pattern)
+                    return intent
+        logger.debug("No intent matched for message: %s", message)
         return None
 
-    def _fallback_response(self, user_input: str) -> str:
-        """Generate a fallback response using the generative model."""
-        prompt = f"User: {user_input}\nAssistant:"
+    def _generate_response(self, intent: str, message: str) -> str:
+        """
+        Produce a response string for a recognized intent.
+
+        Parameters
+        ----------
+        intent : str
+            The recognized intent name.
+        message : str
+            The original user message (may be used for placeholder substitution).
+
+        Returns
+        -------
+        str
+            A response selected from the intent's response pool.
+
+        Raises
+        ------
+        KeyError
+            If the intent is not defined in the internal intent dictionary.
+        """
         try:
-            generated = self.generator(
-                prompt,
-                max_new_tokens=MAX_RESPONSE_TOKENS,
-                num_return_sequences=1,
-                do_sample=True,
-                temperature=0.7,
-                top_p=0.9,
-                truncation=True,
-            )
-            text = generated[0]["generated_text"]
-            # Remove the prompt part and any trailing whitespace
-            response = re.sub(r".*Assistant:\s*", "", text, flags=re.DOTALL).strip()
-            # Ensure a non‑empty response
-            return response or random.choice(FALLBACK_RESPONSES)
-        except Exception as exc:
-            _log_error("Error during fallback generation", exc)
-            return random.choice(FALLBACK_RESPONSES)
+            responses = self._intents[intent]["responses"]
+        except KeyError as exc:
+            logger.error("Intent '%s' not found in intents dictionary.", intent)
+            raise
 
-    def generate_response(self, intent: str, user_input: str) -> str:
-        """
-        Produce a response based on the detected intent.
+        # Simple random choice without external dependencies
+        response_template = responses[0] if len(responses) == 1 else responses[hash(message) % len(responses)]
 
-        Args:
-            intent: Detected intent label.
-            user_input: Original user message (sanitised).
+        # Placeholder handling (e.g., current time)
+        if "{time}" in response_template:
+            current_time = datetime.datetime.now().strftime("%H:%M")
+            response = response_template.replace("{time}", current_time)
+        else:
+            response = response_template
 
-        Returns:
-            Assistant reply string.
-        """
-        # Try rule‑based first
-        response = self._rule_based_response(intent)
-        if response:
-            return response
-        # Otherwise use generative fallback
-        return self._fallback_response(user_input)
-
-    # --------------------------------------------------------------------- #
-    # Main interaction method
-    # --------------------------------------------------------------------- #
-
-    def respond(self, raw_input: str) -> str:
-        """
-        Process user input, update history, and return the bot's reply.
-
-        Args:
-            raw_input: Raw text from the user.
-
-        Returns:
-            The assistant's response.
-        """
-        user_input = _clean_text(raw_input)
-        if not user_input:
-            return "Please say something so I can help you."
-
-        self.add_to_history("user", user_input)
-
-        intent, confidence = self.recognize_intent(user_input)
-        self.logger.debug(
-            "Recognised intent: %s (confidence: %.2f)", intent, confidence
-        )
-
-        response = self.generate_response(intent, user_input)
-        self.add_to_history("assistant", response)
-
+        logger.debug("Generated response for intent '%s': %s", intent, response)
         return response
 
+    def _add_to_history(self, user_msg: str, bot_msg: str) -> None:
+        """
+        Record a user‑bot exchange in the conversation history.
+
+        Parameters
+        ----------
+        user_msg : str
+            Message sent by the user.
+        bot_msg : str
+            Message generated by the bot.
+        """
+        record = MessageRecord(timestamp=datetime.datetime.utcnow(),
+                               user_message=user_msg,
+                               bot_message=bot_msg)
+        with self._history_lock:
+            self._history.append(record)
+        logger.debug("Added to history: %s", record)
+
+    # --------------------------------------------------------------------- #
+    # Public API
+    # --------------------------------------------------------------------- #
+    def process_message(self, message: str) -> str:
+        """
+        Process an incoming user message and return the bot's reply.
+
+        Parameters
+        ----------
+        message : str
+            The user's input text.
+
+        Returns
+        -------
+        str
+            The chatbot's response.
+
+        Raises
+        ------
+        TypeError
+            If ``message`` is not a string.
+        ValueError
+            If ``message`` is an empty string after stripping.
+        """
+        if not isinstance(message, str):
+            logger.error("Invalid input type: expected str, got %s.", type(message).__name__)
+            raise TypeError("Message must be a string.")
+        stripped = message.strip()
+        if not stripped:
+            logger.error("Received empty or whitespace‑only message.")
+            raise ValueError("Message cannot be empty.")
+
+        intent = self._recognize_intent(stripped)
+        if intent:
+            try:
+                response = self._generate_response(intent, stripped)
+            except Exception as exc:  # Catch unexpected errors in response generation
+                logger.exception("Error generating response for intent '%s'.", intent)
+                response = self._fallback_response
+        else:
+            response = self._fallback_response
+
+        self._add_to_history(stripped, response)
+        return response
+
+    def get_history(self, limit: Optional[int] = None) -> List[Tuple[datetime.datetime, str, str]]:
+        """
+        Retrieve the conversation history.
+
+        Parameters
+        ----------
+        limit : Optional[int]
+            Maximum number of recent exchanges to return. If ``None``, returns all.
+
+        Returns
+        -------
+        List[Tuple[datetime.datetime, str, str]]
+            A list of tuples containing (timestamp, user_message, bot_message).
+        """
+        with self._history_lock:
+            sliced = self._history[-limit:] if limit is not None else self._history[:]
+            history = [(rec.timestamp, rec.user_message, rec.bot_message) for rec in sliced]
+        logger.debug("Returned %d history record(s).", len(history))
+        return history
+
+    def clear_history(self) -> None:
+        """
+        Remove all stored conversation records.
+
+        This method is thread‑safe and logs the operation.
+        """
+        with self._history_lock:
+            self._history.clear()
+        logger.info("Conversation history cleared.")
+
 
 # --------------------------------------------------------------------------- #
-# Simple command‑line interface for manual testing
+# Convenience function for quick one‑off usage
 # --------------------------------------------------------------------------- #
+def chat(message: str, bot: Optional[ChatBot] = None) -> str:
+    """
+    One‑line helper that creates a temporary ``ChatBot`` (if none supplied)
+    and returns the bot's reply to ``message``.
+
+    Parameters
+    ----------
+    message : str
+        User input.
+    bot : Optional[ChatBot]
+        Existing chatbot instance to reuse. If omitted, a new instance is created.
+
+    Returns
+    -------
+    str
+        Bot response.
+    """
+    if bot is None:
+        bot = ChatBot()
+    return bot.process_message(message)
 
 
-def main() -> None:
-    """Run a REPL loop for interacting with the chatbot."""
-    logging.basicConfig(
-        level=logging.INFO,
-        format="%(asctime)s %(levelname)s %(name)s: %(message)s",
-        stream=sys.stderr,
-    )
-    bot = ChatBot()
-    print("ChatBot is ready! Type 'exit' or 'quit' to end the conversation.\n")
-
-    while True:
-        try:
-            user_msg = input("You: ").strip()
-        except (EOFError, KeyboardInterrupt):
-            print("\nGoodbye!")
-            break
-
-        if user_msg.lower() in {"exit", "quit"}:
-            print("Goodbye!")
-            break
-
-        reply = bot.respond(user_msg)
-        print(f"Bot: {reply}")
-
-    # Optional: print conversation history before exiting
-    # print("\nConversation history:")
-    # for entry in bot.get_history():
-    #     print(f"{entry['role'].title()}: {entry['content']}")
-
-
-if __name__ == "__main__":
-    main()
+__all__ = ["ChatBot", "chat", "MessageRecord"]

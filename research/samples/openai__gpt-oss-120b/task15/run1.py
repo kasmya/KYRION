@@ -1,228 +1,184 @@
 """
-json_validation_service.py
+json_validator.py
 
-A lightweight JSON validation service that validates JSON data against a
-JSON Schema definition. Features include:
+A tiny JSON data‑validation service built around the ``jsonschema`` package.
+It loads a JSON schema, validates Python data structures against it, and
+returns a detailed list of validation errors.
 
-* Schema definition in JSON (Python dict)
-* Validation of required fields
-* Type checking (string, number, integer, boolean, array, object, null)
-* Pattern matching for string fields (regular expressions)
-* Detailed error reporting (human‑readable messages, JSON pointers)
-* Type hints, docstrings and robust error handling
-* Security best practices: schema self‑validation, safe JSON loading,
-  strict validator configuration.
+Features
+--------
+* Required‑field, type‑checking and pattern‑matching support via JSON Schema.
+* Typed public API with comprehensive docstrings.
+* Explicit error handling – schema loading and validation errors are wrapped
+  in dedicated exception classes.
+* No use of ``eval`` or other unsafe constructs – the module follows security
+  best practices.
 
-Only the standard library and the well‑known ``jsonschema`` package are used.
+Only the Python standard library and the widely‑used ``jsonschema`` package are
+required.
 """
 
 from __future__ import annotations
 
 import json
-import logging
-import re
-from pathlib import Path
-from typing import Any, Dict, List, Tuple, Union
+import pathlib
+from dataclasses import dataclass
+from typing import Any, Dict, List, Sequence
 
-from jsonschema import Draft7Validator, ValidationError, validators, exceptions
+from jsonschema import Draft7Validator, ValidationError  # type: ignore[import]
 
-# Configure module‑level logger
-logger = logging.getLogger(__name__)
-logger.addHandler(logging.NullHandler())
+__all__: Sequence[str] = (
+    "SchemaLoadError",
+    "DataValidationError",
+    "ValidationErrorInfo",
+    "load_schema",
+    "load_json",
+    "validate",
+)
 
 
-class SchemaError(RuntimeError):
-    """Raised when the supplied JSON Schema is invalid or unsafe."""
+class SchemaLoadError(RuntimeError):
+    """Raised when a JSON schema cannot be loaded or parsed."""
 
 
-class ValidationResult:
+class DataValidationError(RuntimeError):
+    """Raised when validation fails for a JSON document.
+
+    The ``errors`` attribute contains a list of :class:`ValidationErrorInfo`
+    instances describing each problem.
     """
-    Container for the result of a validation operation.
 
-    Attributes
-    ----------
-    is_valid: bool
-        ``True`` if data conforms to the schema, ``False`` otherwise.
-    errors: List[Dict[str, Any]]
-        List of dictionaries describing each validation error.
-    """
-
-    __slots__ = ("is_valid", "errors")
-
-    def __init__(self, is_valid: bool, errors: List[Dict[str, Any]]) -> None:
-        self.is_valid = is_valid
+    def __init__(self, errors: List["ValidationErrorInfo"]) -> None:
         self.errors = errors
-
-    def __bool__(self) -> bool:  # pragma: no cover
-        return self.is_valid
-
-    def __repr__(self) -> str:  # pragma: no cover
-        return f"<ValidationResult is_valid={self.is_valid} errors={len(self.errors)}>"
+        super().__init__(f"{len(errors)} validation error(s) encountered.")
 
 
-def _extend_with_default(validator_class: Any) -> Any:
+@dataclass(frozen=True)
+class ValidationErrorInfo:
+    """A lightweight, serialisable representation of a ``jsonschema`` error."""
+
+    message: str
+    """Human‑readable description of the validation problem."""
+
+    path: List[str | int]
+    """JSON pointer path (as a list) to the offending element."""
+
+    validator: str
+    """Name of the JSON‑Schema validator that failed (e.g. ``type``, ``pattern``)."""
+
+    validator_value: Any
+    """The value from the schema that caused the failure (e.g. expected type)."""
+
+    instance: Any
+    """The actual value from the data that failed validation."""
+
+
+def _json_path(error: ValidationError) -> List[str | int]:
     """
-    Extend a jsonschema validator to set defaults on missing properties.
-    This mirrors the behaviour demonstrated in the jsonschema documentation.
+    Convert a ``jsonschema.ValidationError``'s absolute path to a list.
+
+    The path elements are either property names (``str``) or array indices
+    (``int``), matching the JSON Pointer specification.
     """
+    return list(error.absolute_path)
 
-    validate_properties = validator_class.VALIDATORS["properties"]
 
-    def set_defaults(validator, properties, instance, schema):
-        for prop, subschema in properties.items():
-            if "default" in subschema:
-                instance.setdefault(prop, subschema["default"])
-
-        for error in validate_properties(
-            validator, properties, instance, schema,
-        ):
-            yield error
-
-    return validators.extend(
-        validator_class, {"properties": set_defaults}
+def _error_to_info(error: ValidationError) -> ValidationErrorInfo:
+    """
+    Transform a ``jsonschema.ValidationError`` into a :class:`ValidationErrorInfo`.
+    """
+    return ValidationErrorInfo(
+        message=error.message,
+        path=_json_path(error),
+        validator=error.validator,
+        validator_value=error.validator_value,
+        instance=error.instance,
     )
 
 
-# Use the extended validator with default handling (optional but handy)
-DefaultValidatingValidator = _extend_with_default(Draft7Validator)
-
-
-class JSONValidationService:
+def load_schema(schema_path: str | pathlib.Path) -> Dict[str, Any]:
     """
-    Service that validates JSON data against a JSON Schema.
+    Load a JSON schema from a file.
 
     Parameters
     ----------
-    schema : Union[Dict[str, Any], str, Path]
-        The JSON Schema definition as a dict, JSON string, or path to a
-        JSON file.
+    schema_path:
+        Path to a file containing a JSON schema.
+
+    Returns
+    -------
+    dict
+        The parsed JSON schema.
 
     Raises
     ------
-    SchemaError
-        If the supplied schema cannot be parsed or fails JSON‑Schema self‑validation.
+    SchemaLoadError
+        If the file cannot be read or does not contain valid JSON.
     """
-
-    def __init__(self, schema: Union[Dict[str, Any], str, Path]) -> None:
-        self._schema = self._load_schema(schema)
-        self._validator = self._create_validator(self._schema)
-
-    @staticmethod
-    def _load_schema(source: Union[Dict[str, Any], str, Path]) -> Dict[str, Any]:
-        """Load a JSON schema from dict, string or file in a safe manner."""
-        if isinstance(source, dict):
-            schema = source
-        elif isinstance(source, (str, Path)):
-            try:
-                path = Path(source)
-                if path.is_file():
-                    with path.open("r", encoding="utf-8") as fh:
-                        schema = json.load(fh)
-                else:
-                    # Treat the string itself as JSON content
-                    schema = json.loads(str(source))
-            except (json.JSONDecodeError, OSError) as exc:
-                raise SchemaError(f"Unable to load schema: {exc}") from exc
-        else:
-            raise SchemaError(f"Unsupported schema source type: {type(source)}")
-
-        # Ensure the schema itself is a valid Draft‑7 schema
-        try:
-            Draft7Validator.check_schema(schema)
-        except exceptions.SchemaError as exc:
-            raise SchemaError(f"Invalid JSON Schema: {exc.message}") from exc
-
-        return schema
-
-    @staticmethod
-    def _create_validator(schema: Dict[str, Any]) -> Draft7Validator:
-        """
-        Create a Draft‑7 validator with safe configuration.
-
-        * ``format_checker`` is left at default (provides RFC‑3339 date checks, etc.)
-        * ``type`` checking is strict.
-        """
-        return Draft7Validator(schema)
-
-    def validate(self, data: Union[Dict[str, Any], str, Path]) -> ValidationResult:
-        """
-        Validate JSON data against the pre‑loaded schema.
-
-        Parameters
-        ----------
-        data : Union[Dict[str, Any], str, Path]
-            The JSON data to validate. Can be a dict, a JSON string, or a file path.
-
-        Returns
-        -------
-        ValidationResult
-            Result object containing a boolean flag and a list of error dictionaries.
-        """
-        instance = self._load_instance(data)
-        errors = sorted(self._validator.iter_errors(instance), key=lambda e: e.path)
-        if not errors:
-            return ValidationResult(True, [])
-
-        formatted_errors = [self._format_error(err) for err in errors]
-        return ValidationResult(False, formatted_errors)
-
-    @staticmethod
-    def _load_instance(source: Union[Dict[str, Any], str, Path]) -> Dict[str, Any]:
-        """Parse JSON data safely."""
-        if isinstance(source, dict):
-            return source
-        try:
-            path = Path(source)
-            if path.is_file():
-                with path.open("r", encoding="utf-8") as fh:
-                    return json.load(fh)
-            # Not a file → treat as raw JSON string
-            return json.loads(str(source))
-        except (json.JSONDecodeError, OSError) as exc:
-            raise ValueError(f"Unable to load JSON data: {exc}") from exc
-
-    @staticmethod
-    def _format_error(err: ValidationError) -> Dict[str, Any]:
-        """
-        Convert a jsonschema.ValidationError into a serialisable dict.
-
-        Includes:
-        * ``message`` – human‑readable description
-        * ``instance_path`` – JSON Pointer to the offending value
-        * ``schema_path`` – JSON Pointer to the failing schema rule
-        * ``validator`` – keyword that failed (e.g., ``type``, ``required``)
-        * ``validator_value`` – the value of the rule from the schema
-        * ``cause`` – optional nested error details
-        """
-        error_dict: Dict[str, Any] = {
-            "message": err.message,
-            "instance_path": "/" + "/".join(str(p) for p in err.absolute_path),
-            "schema_path": "/" + "/".join(str(p) for p in err.absolute_schema_path),
-            "validator": err.validator,
-            "validator_value": err.validator_value,
-        }
-        # Add the failing value when helpful (but avoid huge dumps)
-        if err.instance is not None and not isinstance(err.instance, (dict, list)):
-            error_dict["instance"] = err.instance
-
-        # Include sub‑errors for ``anyOf``/``oneOf``/``allOf`` failures
-        if err.context:
-            error_dict["cause"] = [JSONValidationService._format_error(c) for c in err.context]
-
-        return error_dict
+    try:
+        path = pathlib.Path(schema_path).expanduser().resolve(strict=True)
+        with path.open("r", encoding="utf-8") as f:
+            return json.load(f)
+    except (OSError, json.JSONDecodeError) as exc:
+        raise SchemaLoadError(f"Failed to load schema from {schema_path!s}: {exc}") from exc
 
 
-# --------------------------------------------------------------------------- #
-# Example usage (removed from production code – kept for illustration only)
-# --------------------------------------------------------------------------- #
-if __name__ == "__main__":
-    logging.basicConfig(level=logging.INFO)
+def load_json(data_path: str | pathlib.Path) -> Any:
+    """
+    Load JSON data from a file.
 
-    # Example schema
-    example_schema = {
-        "$schema": "http://json-schema.org/draft-07/schema#",
-        "title": "Person",
-        "type": "object",
-        "required": ["id", "name", "email"],
-        "properties": {
-            "
+    Parameters
+    ----------
+    data_path:
+        Path to a JSON document.
+
+    Returns
+    -------
+    Any
+        The parsed JSON data (usually ``dict`` or ``list``).
+
+    Raises
+    ------
+    OSError
+        If the file cannot be opened.
+    json.JSONDecodeError
+        If the file does not contain valid JSON.
+    """
+    path = pathlib.Path(data_path).expanduser().resolve(strict=True)
+    with path.open("r", encoding="utf-8") as f:
+        return json.load(f)
+
+
+def validate(data: Any, schema: Dict[str, Any]) -> List[ValidationErrorInfo]:
+    """
+    Validate ``data`` against ``schema`` using Draft‑7 of the JSON Schema spec.
+
+    Parameters
+    ----------
+    data:
+        The Python object to validate (e.g., result of ``json.load``).
+    schema:
+        A JSON Schema represented as a ``dict``.
+
+    Returns
+    -------
+    list[ValidationErrorInfo]
+        A list of validation errors; empty if validation succeeded.
+
+    Raises
+    ------
+    DataValidationError
+        If one or more validation errors are found. The ``errors`` attribute
+        of the exception contains the full list.
+    """
+    try:
+        validator = Draft7Validator(schema)
+    except Exception as exc:  # pragma: no cover – defensive programming
+        raise SchemaLoadError(f"The provided schema is invalid: {exc}") from exc
+
+    errors = [_error_to_info(err) for err in sorted(validator.iter_errors(data), key=lambda e: e.path)]
+
+    if errors:
+        raise DataValidationError(errors)
+
+    return []  # Explicit empty list for successful validation

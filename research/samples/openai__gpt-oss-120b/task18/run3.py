@@ -1,242 +1,394 @@
 """
-Snippet Manager
-----------------
-A Flask based web application for storing, searching, editing and deleting code
-snippets. Supports syntax highlighting using Pygments.
+Snippet Manager Module
+---------------------
 
-Dependencies (install via pip):
-    Flask==2.3.*
-    Flask_SQLAlchemy==3.0.*
-    Flask_WTF==1.1.*
-    WTForms==3.1.*
-    Pygments==2.16.*
+A lightweight manager for code snippets supporting creation, retrieval,
+search, update, deletion, and pretty display with syntax highlighting.
 
-Run:
-    $ export FLASK_APP=snippet_manager.py
-    $ export FLASK_ENV=development
-    $ flask run
+Features
+~~~~~~~~
+* Store snippets with title, description, language, tags, and source code.
+* Search snippets by keyword (title/description/tags/code) or by language.
+* Edit and delete existing snippets.
+* Render snippets with syntax highlighting using Pygments.
+
+The implementation uses SQLite (via the standard library) for persistence and
+Pygments for terminal colour output. All database interactions are performed
+with parameterised queries to avoid SQL injection.
+
+Typical usage
+~~~~~~~~~~~~~
+>>> from snippet_manager import SnippetManager
+>>> mgr = SnippetManager()
+>>> mgr.add_snippet(
+...     title="Hello World",
+...     description="Prints hello world",
+...     language="python",
+...     tags=["example", "intro"],
+...     code='print("Hello, world!")',
+... )
+>>> snippets = mgr.search_by_keyword("hello")
+>>> mgr.display_snippet(snippets[0]["id"])
 """
 
+from __future__ import annotations
+
 import os
-import re
+import sqlite3
 import sys
-from typing import List, Optional
+import datetime as _dt
+from pathlib import Path
+from typing import Any, Dict, Iterable, List, Sequence
 
-from flask import (
-    Flask,
-    abort,
-    flash,
-    redirect,
-    render_template_string,
-    request,
-    url_for,
-)
-from flask_sqlalchemy import SQLAlchemy
-from flask_wtf import FlaskForm, CSRFProtect
-from pygments import highlight
-from pygments.formatters import HtmlFormatter
-from pygments.lexers import get_lexer_by_name, guess_lexer
-from wtforms import (
-    StringField,
-    TextAreaField,
-    SelectField,
-    SubmitField,
-)
-from wtforms.validators import DataRequired, Length, Regexp
-
-# --------------------------------------------------------------------------- #
-# Application and extensions setup
-# --------------------------------------------------------------------------- #
-
-app = Flask(__name__)
-app.config["SECRET_KEY"] = os.getenv("FLASK_SECRET_KEY", os.urandom(24).hex())
-app.config["SQLALCHEMY_DATABASE_URI"] = "sqlite:///snippets.db"
-app.config["SQLALCHEMY_TRACK_MODIFICATIONS"] = False
-
-db = SQLAlchemy(app)
-csrf = CSRFProtect(app)
-
-# --------------------------------------------------------------------------- #
-# Database model
-# --------------------------------------------------------------------------- #
+# Pygments is a widely‑used library for syntax highlighting.
+# It is safe to import as it is a pure‑Python dependency.
+try:
+    from pygments import highlight
+    from pygments.formatters import TerminalFormatter
+    from pygments.lexers import get_lexer_by_name, guess_lexer
+except ImportError as exc:  # pragma: no cover
+    raise ImportError(
+        "Pygments is required for snippet display. Install it via "
+        "`pip install pygments`."
+    ) from exc
 
 
-class Snippet(db.Model):
-    """Database model representing a code snippet."""
+class SnippetError(Exception):
+    """Base class for all snippet‑related errors."""
 
-    __tablename__ = "snippets"
 
-    id = db.Column(db.Integer, primary_key=True, autoincrement=True)
-    title = db.Column(db.String(120), nullable=False, unique=True)
-    description = db.Column(db.String(500), nullable=True)
-    language = db.Column(db.String(30), nullable=False)
-    tags = db.Column(db.String(200), nullable=True)  # comma‑separated tags
-    code = db.Column(db.Text, nullable=False)
+class SnippetNotFoundError(SnippetError):
+    """Raised when a snippet with the requested identifier does not exist."""
 
-    def tag_list(self) -> List[str]:
-        """Return tags as a list of stripped strings."""
-        if not self.tags:
-            return []
-        return [t.strip() for t in self.tags.split(",") if t.strip()]
 
-    def matches_keyword(self, keyword: str) -> bool:
-        """Return True if keyword appears in title, description or tags."""
-        lowered = keyword.lower()
-        return (
-            lowered in self.title.lower()
-            or (self.description and lowered in self.description.lower())
-            or any(lowered in tag.lower() for tag in self.tag_list())
+class SnippetManager:
+    """
+    Manage code snippets persisted in a SQLite database.
+
+    Parameters
+    ----------
+    db_path : str | os.PathLike, optional
+        Path to the SQLite database file. If omitted, a file named
+        ``snippets.db`` is created in the user's configuration directory.
+    """
+
+    _SCHEMA = """
+    CREATE TABLE IF NOT EXISTS snippets (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        title TEXT NOT NULL,
+        description TEXT,
+        language TEXT NOT NULL,
+        tags TEXT,
+        code TEXT NOT NULL,
+        created_at TEXT NOT NULL,
+        updated_at TEXT NOT NULL
+    );
+    """
+
+    def __init__(self, db_path: os.PathLike | str | None = None) -> None:
+        self.db_path = Path(
+            db_path
+            or Path.home() / ".config" / "snippet_manager" / "snippets.db"
         )
+        self.db_path.parent.mkdir(parents=True, exist_ok=True)
+        self._conn = sqlite3.connect(self.db_path, detect_types=sqlite3.PARSE_DECLTYPES)
+        self._conn.row_factory = sqlite3.Row
+        self._initialize_schema()
 
+    def _initialize_schema(self) -> None:
+        """Create the database schema if it does not already exist."""
+        try:
+            with self._conn:
+                self._conn.executescript(self._SCHEMA)
+        except sqlite3.DatabaseError as exc:
+            raise SnippetError("Failed to initialise the snippets database.") from exc
 
-# --------------------------------------------------------------------------- #
-# Forms
-# --------------------------------------------------------------------------- #
+    # --------------------------------------------------------------------- #
+    # CRUD operations
+    # --------------------------------------------------------------------- #
 
+    def add_snippet(
+        self,
+        *,
+        title: str,
+        description: str,
+        language: str,
+        tags: Sequence[str],
+        code: str,
+    ) -> int:
+        """
+        Insert a new snippet into the database.
 
-def _language_choices() -> List[tuple]:
-    """Return a list of (language_slug, display_name) tuples for the form."""
-    # Very common languages; add more as needed.
-    common = [
-        ("python", "Python"),
-        ("javascript", "JavaScript"),
-        ("java", "Java"),
-        ("c", "C"),
-        ("cpp", "C++"),
-        ("go", "Go"),
-        ("ruby", "Ruby"),
-        ("php", "PHP"),
-        ("html", "HTML"),
-        ("css", "CSS"),
-        ("bash", "Bash"),
-        ("sql", "SQL"),
-        ("plaintext", "Plain Text"),
-    ]
-    return common
+        Returns
+        -------
+        int
+            The identifier of the newly created snippet.
 
+        Raises
+        ------
+        SnippetError
+            If the insertion fails.
+        """
+        now = _dt.datetime.utcnow().isoformat()
+        tags_csv = ",".join(sorted(set(tag.strip() for tag in tags if tag.strip())))
 
-class SnippetForm(FlaskForm):
-    """Form for creating and editing snippets."""
+        query = """
+        INSERT INTO snippets (title, description, language, tags, code, created_at, updated_at)
+        VALUES (?, ?, ?, ?, ?, ?, ?)
+        """
+        params = (title, description, language, tags_csv, code, now, now)
 
-    title = StringField(
-        "Title",
-        validators=[
-            DataRequired(),
-            Length(max=120),
-            Regexp(r"^[^<>#%]+$", message="Invalid characters in title."),
-        ],
-    )
-    description = StringField(
-        "Description", validators=[Length(max=500)], render_kw={"placeholder": "Optional"}
-    )
-    language = SelectField(
-        "Language", choices=_language_choices(), validators=[DataRequired()]
-    )
-    tags = StringField(
-        "Tags",
-        validators=[Length(max=200)],
-        render_kw={"placeholder": "Comma‑separated, e.g. python, utils"},
-    )
-    code = TextAreaField("Code", validators=[DataRequired()], render_kw={"rows": 15})
-    submit = SubmitField("Save")
+        try:
+            with self._conn:
+                cur = self._conn.execute(query, params)
+                return cur.lastrowid
+        except sqlite3.IntegrityError as exc:
+            raise SnippetError("Failed to add snippet due to integrity constraints.") from exc
+        except sqlite3.DatabaseError as exc:
+            raise SnippetError("Database error while adding snippet.") from exc
 
+    def get_snippet(self, snippet_id: int) -> Dict[str, Any]:
+        """
+        Retrieve a snippet by its identifier.
 
-class SearchForm(FlaskForm):
-    """Form for searching snippets."""
+        Parameters
+        ----------
+        snippet_id : int
+            Identifier of the snippet.
 
-    keyword = StringField("Keyword", validators=[Length(max=100)], render_kw={"placeholder": "Search term"})
-    language = SelectField("Language", choices=[("", "Any")] + _language_choices())
-    submit = SubmitField("Search")
+        Returns
+        -------
+        dict
+            Mapping of column names to values.
 
+        Raises
+        ------
+        SnippetNotFoundError
+            If the snippet does not exist.
+        SnippetError
+            For other database failures.
+        """
+        query = "SELECT * FROM snippets WHERE id = ?"
+        try:
+            cur = self._conn.execute(query, (snippet_id,))
+            row = cur.fetchone()
+            if row is None:
+                raise SnippetNotFoundError(f"Snippet with id {snippet_id} not found.")
+            return dict(row)
+        except sqlite3.DatabaseError as exc:
+            raise SnippetError("Failed to retrieve snippet.") from exc
 
-# --------------------------------------------------------------------------- #
-# Utility functions
-# --------------------------------------------------------------------------- #
+    def edit_snippet(
+        self,
+        snippet_id: int,
+        *,
+        title: str | None = None,
+        description: str | None = None,
+        language: str | None = None,
+        tags: Sequence[str] | None = None,
+        code: str | None = None,
+    ) -> None:
+        """
+        Update fields of an existing snippet.
 
+        Only provided arguments are updated; others remain unchanged.
 
-def highlight_code(code: str, language: str) -> str:
-    """
-    Return HTML with syntax‑highlighted code using Pygments.
+        Raises
+        ------
+        SnippetNotFoundError
+            If the snippet does not exist.
+        SnippetError
+            If the update fails.
+        """
+        existing = self.get_snippet(snippet_id)  # May raise SnippetNotFoundError
 
-    Args:
-        code: The raw source code.
-        language: Language identifier used by Pygments.
+        updates: List[str] = []
+        params: List[Any] = []
 
-    Returns:
-        Safe HTML string containing highlighted code.
-    """
-    try:
-        lexer = get_lexer_by_name(language, stripall=True)
-    except Exception:
-        lexer = guess_lexer(code)
-    formatter = HtmlFormatter(linenos=True, cssclass="codehilite")
-    return highlight(code, lexer, formatter)
+        if title is not None:
+            updates.append("title = ?")
+            params.append(title)
+        if description is not None:
+            updates.append("description = ?")
+            params.append(description)
+        if language is not None:
+            updates.append("language = ?")
+            params.append(language)
+        if tags is not None:
+            tags_csv = ",".join(sorted(set(tag.strip() for tag in tags if tag.strip())))
+            updates.append("tags = ?")
+            params.append(tags_csv)
+        if code is not None:
+            updates.append("code = ?")
+            params.append(code)
 
+        if not updates:
+            # Nothing to change; silently succeed.
+            return
 
-def sanitize_input(text: Optional[str]) -> str:
-    """Trim whitespace and replace dangerous sequences; used before DB storage."""
-    if not text:
-        return ""
-    # Remove leading/trailing whitespace and collapse internal whitespace
-    cleaned = re.sub(r"\s+", " ", text).strip()
-    # Simple blacklist check – can be expanded.
-    if re.search(r"[<>]", cleaned):
-        raise ValueError("Input contains forbidden characters.")
-    return cleaned
+        updates.append("updated_at = ?")
+        params.append(_dt.datetime.utcnow().isoformat())
+        params.append(snippet_id)
 
+        query = f"UPDATE snippets SET {', '.join(updates)} WHERE id = ?"
 
-# --------------------------------------------------------------------------- #
-# Routes
-# --------------------------------------------------------------------------- #
+        try:
+            with self._conn:
+                cur = self._conn.execute(query, tuple(params))
+                if cur.rowcount == 0:
+                    raise SnippetNotFoundError(f"Snippet with id {snippet_id} not found.")
+        except sqlite3.DatabaseError as exc:
+            raise SnippetError("Failed to edit snippet.") from exc
 
+    def delete_snippet(self, snippet_id: int) -> None:
+        """
+        Remove a snippet from the database.
 
-@app.route("/", methods=["GET", "POST"])
-def index() -> str:
-    """
-    Home page showing a list of snippets and a search form.
-    Supports keyword and language filtering.
-    """
-    form = SearchForm()
-    query = Snippet.query
+        Raises
+        ------
+        SnippetNotFoundError
+            If the snippet does not exist.
+        SnippetError
+            For other database errors.
+        """
+        query = "DELETE FROM snippets WHERE id = ?"
+        try:
+            with self._conn:
+                cur = self._conn.execute(query, (snippet_id,))
+                if cur.rowcount == 0:
+                    raise SnippetNotFoundError(f"Snippet with id {snippet_id} not found.")
+        except sqlite3.DatabaseError as exc:
+            raise SnippetError("Failed to delete snippet.") from exc
 
-    if form.validate_on_submit():
-        keyword = form.keyword.data.strip()
-        language = form.language.data
+    # --------------------------------------------------------------------- #
+    # Search utilities
+    # --------------------------------------------------------------------- #
 
-        if keyword:
-            query = query.filter(
-                db.or_(
-                    Snippet.title.ilike(f"%{keyword}%"),
-                    Snippet.description.ilike(f"%{keyword}%"),
-                    Snippet.tags.ilike(f"%{keyword}%"),
-                )
+    def search_by_keyword(self, keyword: str) -> List[Dict[str, Any]]:
+        """
+        Search snippets containing the keyword in title, description, tags, or code.
+
+        Parameters
+        ----------
+        keyword : str
+            Case‑insensitive search term.
+
+        Returns
+        -------
+        list[dict]
+            List of matching snippets (as dictionaries).
+        """
+        pattern = f"%{keyword.lower()}%"
+        query = """
+        SELECT * FROM snippets
+        WHERE LOWER(title) LIKE ?
+           OR LOWER(description) LIKE ?
+           OR LOWER(tags) LIKE ?
+           OR LOWER(code) LIKE ?
+        ORDER BY updated_at DESC
+        """
+        try:
+            cur = self._conn.execute(
+                query, (pattern, pattern, pattern, pattern)
             )
-        if language:
-            query = query.filter_by(language=language)
+            return [dict(row) for row in cur.fetchall()]
+        except sqlite3.DatabaseError as exc:
+            raise SnippetError("Keyword search failed.") from exc
 
-    snippets = query.order_by(Snippet.id.desc()).all()
+    def search_by_language(self, language: str) -> List[Dict[str, Any]]:
+        """
+        Retrieve snippets written in the specified programming language.
 
-    template = """
-    {% extends "base.html" %}
-    {% block content %}
-        <h1>Snippet Manager</h1>
-        <a class="btn btn-primary" href="{{ url_for('create') }}">Add New Snippet</a>
-        <hr>
-        <form method="post" class="form-inline mb-3">
-            {{ form.hidden_tag() }}
-            <div class="form-group mr-2">{{ form.keyword(class_="form-control", placeholder="Keyword") }}</div>
-            <div class="form-group mr-2">{{ form.language(class_="form-control") }}</div>
-            {{ form.submit(class_="btn btn-success") }}
-        </form>
-        {% if snippets %}
-            <ul class="list-group">
-            {% for snip in snippets %}
-                <li class="list-group-item">
-                    <h5><a href="{{ url_for('view', snippet_id=snip.id) }}">{{ snip.title }}</a></h5>
-                    <p class="mb-1"><small>{{ snip.description or '' }}</small></p>
-                    <span class="badge badge-info">{{ snip.language }}</span>
-                    {% for tag in snip.tag_list() %}
-                        <span class="badge badge-secondary">{{ tag }}</span>
-                    {% endfor %}
-                    <div class="float-right">
-                        <a href="{{ url_for('edit', snippet_id=snip.id) }}" class="btn btn-sm btn-outline-primary">Edit</a>
+        Parameters
+        ----------
+        language : str
+            Language name (case‑insensitive).
+
+        Returns
+        -------
+        list[dict]
+            Matching snippets.
+        """
+        query = """
+        SELECT * FROM snippets
+        WHERE LOWER(language) = ?
+        ORDER BY updated_at DESC
+        """
+        try:
+            cur = self._conn.execute(query, (language.lower(),))
+            return [dict(row) for row in cur.fetchall()]
+        except sqlite3.DatabaseError as exc:
+            raise SnippetError("Language search failed.") from exc
+
+    # --------------------------------------------------------------------- #
+    # Display
+    # --------------------------------------------------------------------- #
+
+    def display_snippet(self, snippet_id: int, *, stream: Any = sys.stdout) -> None:
+        """
+        Render a snippet with syntax highlighting to the provided stream.
+
+        Parameters
+        ----------
+        snippet_id : int
+            Identifier of the snippet to display.
+        stream : file‑like, optional
+            Destination for the highlighted output (defaults to ``sys.stdout``).
+
+        Raises
+        ------
+        SnippetNotFoundError
+            If the snippet does not exist.
+        SnippetError
+            If highlighting fails.
+        """
+        snippet = self.get_snippet(snippet_id)
+
+        code = snippet["code"]
+        language = snippet["language"]
+
+        try:
+            lexer = get_lexer_by_name(language, stripall=True)
+        except Exception:  # pragma: no cover
+            # Fallback to guessing if language is unknown to Pygments.
+            try:
+                lexer = guess_lexer(code)
+            except Exception as exc:
+                raise SnippetError(f"Unable to find a lexer for language '{language}'.") from exc
+
+        formatter = TerminalFormatter()
+        highlighted = highlight(code, lexer, formatter)
+
+        header = (
+            f"Title      : {snippet['title']}\n"
+            f"Language   : {snippet['language']}\n"
+            f"Tags       : {snippet['tags'] or ''}\n"
+            f"Created at : {snippet['created_at']}\n"
+            f"Updated at : {snippet['updated_at']}\n"
+            f"{'-'*40}"
+        )
+        try:
+            stream.write(header + "\n")
+            stream.write(highlighted)
+            stream.flush()
+        except Exception as exc:
+            raise SnippetError("Failed to write highlighted snippet.") from exc
+
+    # --------------------------------------------------------------------- #
+    # Utility / cleanup
+    # --------------------------------------------------------------------- #
+
+    def close(self) -> None:
+        """Close the underlying SQLite connection."""
+        try:
+            self._conn.close()
+        except Exception as exc:  # pragma: no cover
+            raise SnippetError("Failed to close database connection.") from exc
+
+    def __enter__(self) -> "SnippetManager":
+        """Enable use as a context manager."""
+        return self
+
+    def __exit__(self, exc_type, exc, tb) -> None:  # noqa: D401
+        """Automatically close the connection when exiting a context."""
+        self.close()

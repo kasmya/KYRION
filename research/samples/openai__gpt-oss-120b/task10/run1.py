@@ -1,316 +1,362 @@
 """
-Collaborative Filtering Recommender System
-==========================================
+collab_filter.py
 
-This module provides a simple user‑based collaborative filtering implementation
-with the following capabilities:
+A lightweight collaborative‑filtering recommender system based on user‑based
+cosine similarity. The module provides utilities to:
 
-* Construction of a user‑item rating matrix from a Pandas DataFrame.
-* Cosine similarity computation between users.
-* Generation of top‑N item recommendations for a given user.
-* Evaluation utilities: precision@k, recall@k, MAP@k, and NDCG@k.
+* Build a user‑item rating matrix from a pandas DataFrame.
+* Compute pairwise user similarity using cosine distance.
+* Generate top‑N item recommendations for a given user.
+* Evaluate recommendations with precision@K and recall@K.
 
-Only the Python standard library together with ``numpy`` and ``pandas`` are
-required.
+Only the Python standard library and widely‑used packages (pandas, numpy,
+scipy) are required.
 """
 
 from __future__ import annotations
 
-import math
-import warnings
-from typing import Dict, Iterable, List, Tuple, Union
+import logging
+from collections import defaultdict
+from typing import Dict, Iterable, List, Tuple
 
 import numpy as np
 import pandas as pd
+from scipy.spatial.distance import cosine
+
+__all__ = [
+    "build_user_item_matrix",
+    "compute_user_similarity",
+    "recommend_top_n",
+    "precision_at_k",
+    "recall_at_k",
+    "train_test_split",
+]
+
+# Configure a module‑level logger.
+logger = logging.getLogger(__name__)
+if not logger.handlers:
+    handler = logging.StreamHandler()
+    formatter = logging.Formatter(
+        "%(asctime)s %(levelname)s %(name)s - %(message)s"
+    )
+    handler.setFormatter(formatter)
+    logger.addHandler(handler)
+    logger.setLevel(logging.INFO)
 
 
-class CollaborativeFilteringRecommender:
+def _validate_dataframe(
+    df: pd.DataFrame,
+    required_columns: Iterable[str],
+) -> None:
     """
-    User‑based collaborative filtering recommender.
+    Ensure that *df* contains all *required_columns*.
 
-    Parameters
-    ----------
-    min_common : int, optional
-        Minimum number of common rated items required to compute a similarity
-        value between two users. Defaults to ``1``.
+    Args:
+        df: DataFrame to validate.
+        required_columns: Column names that must be present.
+
+    Raises:
+        ValueError: If any required column is missing.
     """
+    missing = [col for col in required_columns if col not in df.columns]
+    if missing:
+        raise ValueError(f"Missing required columns: {missing}")
 
-    def __init__(self, min_common: int = 1) -> None:
-        if not isinstance(min_common, int) or min_common < 1:
-            raise ValueError("min_common must be a positive integer.")
-        self.min_common = min_common
-        self.user_ids: List[int] = []
-        self.item_ids: List[int] = []
-        self.rating_matrix: np.ndarray | None = None
-        self.user_similarity: np.ndarray | None = None
-        self._user_index: Dict[int, int] = {}
-        self._item_index: Dict[int, int] = {}
 
-    # --------------------------------------------------------------------- #
-    # Data preparation
-    # --------------------------------------------------------------------- #
-    def fit(self, interactions: pd.DataFrame) -> None:
-        """
-        Build the user‑item rating matrix and compute the user similarity matrix.
+def build_user_item_matrix(
+    ratings: pd.DataFrame,
+    user_col: str = "user_id",
+    item_col: str = "item_id",
+    rating_col: str = "rating",
+) -> pd.DataFrame:
+    """
+    Construct a user‑item matrix where rows are users, columns are items,
+    and cells contain the rating (or ``0`` if missing).
 
-        Parameters
-        ----------
-        interactions : pd.DataFrame
-            Must contain the columns ``user_id``, ``item_id`` and ``rating``.
-            ``rating`` should be numeric (float or int). Rows with missing values
-            are ignored.
+    Args:
+        ratings: DataFrame with at least ``user_col``, ``item_col`` and
+            ``rating_col``.
+        user_col: Name of the column containing user identifiers.
+        item_col: Name of the column containing item identifiers.
+        rating_col: Name of the column containing rating values.
 
-        Raises
-        ------
-        ValueError
-            If required columns are missing or if the DataFrame is empty.
-        """
-        required = {"user_id", "item_id", "rating"}
-        if not required.issubset(interactions.columns):
-            raise ValueError(f"DataFrame must contain columns: {required}")
+    Returns:
+        A DataFrame indexed by users and columned by items.
 
-        df = interactions.dropna(subset=["user_id", "item_id", "rating"]).copy()
-        if df.empty:
-            raise ValueError("No valid interaction records found after cleaning.")
+    Raises:
+        ValueError: If required columns are absent or if the rating column
+            contains non‑numeric data.
+    """
+    _validate_dataframe(ratings, [user_col, item_col, rating_col])
 
-        # Encode users & items as contiguous integer indices
-        self.user_ids = sorted(df["user_id"].unique())
-        self.item_ids = sorted(df["item_id"].unique())
-        self._user_index = {uid: i for i, uid in enumerate(self.user_ids)}
-        self._item_index = {iid: i for i, iid in enumerate(self.item_ids)}
-        n_users = len(self.user_ids)
-        n_items = len(self.item_ids)
+    if not np.issubdtype(ratings[rating_col].dtype, np.number):
+        raise ValueError(f"Column '{rating_col}' must contain numeric values.")
 
-        # Sparse matrix construction using dense numpy array (suitable for small‑medium data)
-        self.rating_matrix = np.zeros((n_users, n_items), dtype=np.float32)
+    logger.debug("Pivoting ratings DataFrame to user‑item matrix.")
+    matrix = ratings.pivot_table(
+        index=user_col,
+        columns=item_col,
+        values=rating_col,
+        aggfunc="mean",
+        fill_value=0,
+    )
+    logger.info(
+        "User‑item matrix built with %d users and %d items.",
+        matrix.shape[0],
+        matrix.shape[1],
+    )
+    return matrix
 
-        for _, row in df.iterrows():
-            try:
-                u = self._user_index[int(row["user_id"])]
-                i = self._item_index[int(row["item_id"])]
-                self.rating_matrix[u, i] = float(row["rating"])
-            except (KeyError, ValueError) as exc:
-                # Defensive programming: skip malformed rows
-                warnings.warn(f"Skipping row due to unexpected values: {exc}")
 
-        self._compute_user_similarity()
+def compute_user_similarity(matrix: pd.DataFrame) -> pd.DataFrame:
+    """
+    Compute cosine similarity between all pairs of users.
 
-    # --------------------------------------------------------------------- #
-    # Similarity computation
-    # --------------------------------------------------------------------- #
-    def _compute_user_similarity(self) -> None:
-        """Compute cosine similarity between users, respecting ``min_common``."""
-        if self.rating_matrix is None:
-            raise RuntimeError("Model must be fitted before computing similarity.")
+    Args:
+        matrix: User‑item rating matrix (users as rows).
 
-        n_users = self.rating_matrix.shape[0]
-        self.user_similarity = np.zeros((n_users, n_users), dtype=np.float32)
+    Returns:
+        A DataFrame where entry ``(u, v)`` is the cosine similarity between
+        users *u* and *v*.
 
-        # Pre‑compute norms, handling zero‑norm vectors safely
-        norms = np.linalg.norm(self.rating_matrix, axis=1)
-        zero_norm_mask = norms == 0
-        if np.any(zero_norm_mask):
-            warnings.warn("Some users have zero rating vectors; they will have no similarity.")
-            norms[zero_norm_mask] = 1.0  # Prevent division by zero
+    Raises:
+        ValueError: If the matrix is empty or contains non‑numeric values.
+    """
+    if matrix.empty:
+        raise ValueError("The input user‑item matrix is empty.")
+    if not np.issubdtype(matrix.values.dtype, np.number):
+        raise ValueError("User‑item matrix must contain numeric values.")
 
-        normalized = self.rating_matrix / norms[:, None]
+    logger.debug("Normalizing user vectors for cosine similarity.")
+    # Normalize rows to unit length; avoid division by zero.
+    norm = np.linalg.norm(matrix.values, axis=1, keepdims=True)
+    norm[norm == 0] = 1.0
+    normalized = matrix.values / norm
 
-        # Compute full cosine similarity matrix
-        sim = normalized @ normalized.T
+    logger.debug("Computing pairwise cosine similarity.")
+    similarity = np.dot(normalized, normalized.T)
 
-        # Apply min_common filter
-        common_counts = (self.rating_matrix > 0).astype(int) @ (self.rating_matrix > 0).T.astype(int)
-        sim[common_counts < self.min_common] = 0.0
+    # Clip possible numeric noise.
+    np.clip(similarity, -1.0, 1.0, out=similarity)
 
-        # Clip numerical noise
-        np.clip(sim, -1.0, 1.0, out=sim)
-        self.user_similarity = sim
+    sim_df = pd.DataFrame(
+        similarity,
+        index=matrix.index,
+        columns=matrix.index,
+    )
+    logger.info("User similarity matrix computed.")
+    return sim_df
 
-    # --------------------------------------------------------------------- #
-    # Recommendation
-    # --------------------------------------------------------------------- #
-    def recommend(self, user_id: int, n: int = 10, filter_seen: bool = True) -> List[Tuple[int, float]]:
-        """
-        Generate top‑N item recommendations for a given user.
 
-        Parameters
-        ----------
-        user_id : int
-            Identifier of the target user.
-        n : int, optional
-            Number of recommendations to return. Must be positive. Default is ``10``.
-        filter_seen : bool, optional
-            If ``True`` (default), items already rated by the user are excluded
-            from the results.
+def recommend_top_n(
+    user_id,
+    matrix: pd.DataFrame,
+    similarity: pd.DataFrame,
+    n: int = 10,
+    filter_seen: bool = True,
+) -> List[Tuple]:
+    """
+    Generate the top‑N item recommendations for *user_id*.
 
-        Returns
-        -------
-        List[Tuple[int, float]]
-            List of ``(item_id, predicted_score)`` sorted by descending score.
+    The score for an unseen item is the weighted average of ratings from
+    similar users, weighted by cosine similarity.
 
-        Raises
-        ------
-        KeyError
-            If ``user_id`` is unknown to the model.
-        ValueError
-            If ``n`` is not a positive integer.
-        """
-        if self.user_similarity is None or self.rating_matrix is None:
-            raise RuntimeError("Model has not been fitted.")
-        if not isinstance(n, int) or n <= 0:
-            raise ValueError("Parameter 'n' must be a positive integer.")
-        if user_id not in self._user_index:
-            raise KeyError(f"User ID {user_id} not found in the model.")
+    Args:
+        user_id: Identifier of the target user (must be present in *matrix*).
+        matrix: User‑item rating matrix.
+        similarity: User‑user similarity matrix.
+        n: Number of items to recommend.
+        filter_seen: If ``True``, items already rated by the user are excluded.
 
-        user_idx = self._user_index[user_id]
-        sim_vector = self.user_similarity[user_idx]  # shape: (n_users,)
+    Returns:
+        A list of tuples ``(item_id, score)`` sorted by descending score.
 
-        # Weighted sum of other users' ratings
-        weighted_ratings = sim_vector @ self.rating_matrix  # shape: (n_items,)
+    Raises:
+        KeyError: If *user_id* is not found in *matrix* or *similarity*.
+        ValueError: If *n* is not a positive integer.
+    """
+    if n <= 0:
+        raise ValueError("Parameter 'n' must be a positive integer.")
+    if user_id not in matrix.index:
+        raise KeyError(f"User ID {user_id!r} not found in the rating matrix.")
+    if user_id not in similarity.index:
+        raise KeyError(f"User ID {user_id!r} not found in the similarity matrix.")
 
-        # Normalise by sum of absolute similarities to avoid bias from many similar users
-        sim_abs_sum = np.sum(np.abs(sim_vector))
-        if sim_abs_sum == 0:
-            warnings.warn(f"User {user_id} has zero similarity to any other user.")
-            scores = np.zeros_like(weighted_ratings)
-        else:
-            scores = weighted_ratings / sim_abs_sum
+    logger.debug("Computing recommendation scores for user %s.", user_id)
+    user_ratings = matrix.loc[user_id]
+    similar_users = similarity[user_id]
 
-        if filter_seen:
-            seen_mask = self.rating_matrix[user_idx] > 0
-            scores[seen_mask] = -np.inf  # Ensure they are not recommended
+    # Exclude the target user from the similarity weights.
+    similar_users = similar_users.drop(user_id)
 
-        # Retrieve top‑N indices
-        top_idx = np.argpartition(-scores, range(min(n, scores.size)))[:n]
-        top_idx_sorted = top_idx[np.argsort(-scores[top_idx])]
+    # Weighted sum of ratings.
+    weighted_ratings = np.dot(similar_users.values, matrix.values)
+    similarity_sums = similar_users.values.sum()
+    if similarity_sums == 0:
+        logger.warning("User %s has zero similarity sum; returning empty list.", user_id)
+        return []
 
-        recommendations = [
-            (self.item_ids[i], float(scores[i])) for i in top_idx_sorted if not np.isinf(scores[i])
-        ]
+    scores = weighted_ratings / similarity_sums
 
-        return recommendations
+    # Build a Series aligned with items.
+    score_series = pd.Series(scores, index=matrix.columns)
 
-    # --------------------------------------------------------------------- #
-    # Evaluation utilities
-    # --------------------------------------------------------------------- #
-    @staticmethod
-    def _precision_at_k(true_items: Iterable[int], pred_items: List[int], k: int) -> float:
-        if k == 0:
-            return 0.0
-        pred_k = set(pred_items[:k])
-        true_set = set(true_items)
-        return len(pred_k & true_set) / k
+    if filter_seen:
+        unseen = user_ratings[user_ratings == 0].index
+        score_series = score_series.loc[unseen]
 
-    @staticmethod
-    def _recall_at_k(true_items: Iterable[int], pred_items: List[int], k: int) -> float:
-        if k == 0:
-            return 0.0
-        pred_k = set(pred_items[:k])
-        true_set = set(true_items)
-        if not true_set:
-            return 0.0
-        return len(pred_k & true_set) / len(true_set)
+    top_items = score_series.nlargest(n)
+    recommendations = list(zip(top_items.index, top_items.values))
+    logger.info("Generated %d recommendations for user %s.", len(recommendations), user_id)
+    return recommendations
 
-    @staticmethod
-    def _average_precision_at_k(true_items: Iterable[int], pred_items: List[int], k: int) -> float:
-        """Mean Average Precision (MAP) for a single user."""
-        true_set = set(true_items)
-        if not true_set:
-            return 0.0
-        score = 0.0
-        hits = 0
-        for i in range(min(k, len(pred_items))):
-            if pred_items[i] in true_set:
-                hits += 1
-                score += hits / (i + 1)
-        return score / min(len(true_set), k)
 
-    @staticmethod
-    def _dcg_at_k(pred_items: List[int], true_items: Iterable[int], k: int) -> float:
-        """Discounted Cumulative Gain."""
-        true_set = set(true_items)
-        dcg = 0.0
-        for i in range(min(k, len(pred_items))):
-            rel = 1 if pred_items[i] in true_set else 0
-            if rel:
-                dcg += 1 / math.log2(i + 2)  # i+2 because rank starts at 1
-        return dcg
+def precision_at_k(
+    recommendations: Dict,
+    test_interactions: pd.DataFrame,
+    user_col: str = "user_id",
+    item_col: str = "item_id",
+    k: int = 10,
+) -> float:
+    """
+    Compute precision@K across all users.
 
-    @staticmethod
-    def _ndcg_at_k(true_items: Iterable[int], pred_items: List[int], k: int) -> float:
-        """Normalized Discounted Cumulative Gain."""
-        ideal_dcg = CollaborativeFilteringRecommender._dcg_at_k(
-            list(true_items)[:k], true_items, k
-        )
-        if ideal_dcg == 0:
-            return 0.0
-        actual_dcg = CollaborativeFilteringRecommender._dcg_at_k(pred_items, true_items, k)
-        return actual_dcg / ideal_dcg
+    Args:
+        recommendations: Mapping ``user_id -> list of recommended item_id``.
+        test_interactions: Ground‑truth interactions (must contain *user_col*
+            and *item_col*).
+        user_col: Name of the user identifier column in *test_interactions*.
+        item_col: Name of the item identifier column in *test_interactions*.
+        k: Cut‑off rank for evaluation.
 
-    def evaluate(
-        self,
-        test_interactions: pd.DataFrame,
-        ks: Iterable[int] = (5, 10, 20),
-    ) -> Dict[int, Dict[str, float]]:
-        """
-        Evaluate the recommender on a test set using precision, recall, MAP and NDCG.
+    Returns:
+        Mean precision@K.
 
-        Parameters
-        ----------
-        test_interactions : pd.DataFrame
-            Must contain ``user_id`` and ``item_id`` columns. Each row is a
-            ground‑truth interaction (e.g., a held‑out rating).
-        ks : Iterable[int], optional
-            Cut‑off values for the metrics. Default ``(5, 10, 20)``.
+    Raises:
+        ValueError: If *k* is not positive or if inputs are malformed.
+    """
+    if k <= 0:
+        raise ValueError("Parameter 'k' must be a positive integer.")
+    _validate_dataframe(test_interactions, [user_col, item_col])
 
-        Returns
-        -------
-        Dict[int, Dict[str, float]]
-            Mapping from ``k`` to a dictionary with metric names and their mean values.
-        """
-        if not {"user_id", "item_id"}.issubset(test_interactions.columns):
-            raise ValueError("test_interactions must contain 'user_id' and 'item_id' columns.")
+    # Build ground‑truth sets.
+    gt: Dict = defaultdict(set)
+    for _, row in test_interactions.iterrows():
+        gt[row[user_col]].add(row[item_col])
 
-        # Build ground truth per user
-        gt: Dict[int, List[int]] = {}
-        for _, row in test_interactions.iterrows():
-            uid = int(row["user_id"])
-            iid = int(row["item_id"])
-            gt.setdefault(uid, []).append(iid)
+    precisions = []
+    for user, recs in recommendations.items():
+        if not recs:
+            continue
+        top_k = recs[:k]
+        hit_count = sum(1 for item in top_k if item in gt.get(user, set()))
+        precisions.append(hit_count / k)
 
-        results: Dict[int, Dict[str, float]] = {}
-        for k in ks:
-            precisions, recalls, maps, ndcgs = [], [], [], []
-            for uid, true_items in gt.items():
-                if uid not in self._user_index:
-                    # Skip unknown users – could also count as zero score
-                    continue
-                recs = self.recommend(uid, n=k, filter_seen=False)
-                pred_items = [iid for iid, _ in recs]
+    if not precisions:
+        logger.warning("No recommendations to evaluate for precision@%d.", k)
+        return 0.0
+    mean_precision = float(np.mean(precisions))
+    logger.info("Precision@%d = %.4f", k, mean_precision)
+    return mean_precision
 
-                precisions.append(self._precision_at_k(true_items, pred_items, k))
-                recalls.append(self._recall_at_k(true_items, pred_items, k))
-                maps.append(self._average_precision_at_k(true_items, pred_items, k))
-                ndcgs.append(self._ndcg_at_k(true_items, pred_items, k))
 
-            # Aggregate (mean) scores; handle division by zero when no users are evaluated.
-            divisor = max(1, len(precisions))
-            results[k] = {
-                "precision": sum(precisions) / divisor,
-                "recall": sum(recalls) / divisor,
-                "map": sum(maps) / divisor,
-                "ndcg": sum(ndcgs) / divisor,
-            }
+def recall_at_k(
+    recommendations: Dict,
+    test_interactions: pd.DataFrame,
+    user_col: str = "user_id",
+    item_col: str = "item_id",
+    k: int = 10,
+) -> float:
+    """
+    Compute recall@K across all users.
 
-        return results
+    Args:
+        recommendations: Mapping ``user_id -> list of recommended item_id``.
+        test_interactions: Ground‑truth interactions (must contain *user_col*
+            and *item_col*).
+        user_col: Name of the user identifier column in *test_interactions*.
+        item_col: Name of the item identifier column in *test_interactions*.
+        k: Cut‑off rank for evaluation.
 
-    # --------------------------------------------------------------------- #
-    # Utility / safety
-    # --------------------------------------------------------------------- #
-    @staticmethod
-    def _safe_int(value: Union[int, str, float]) -> int:
-        """Convert a value to int safely, raising a clear error on failure."""
-        try:
-            return int(value)
-        except (TypeError, ValueError) as exc:
-            raise ValueError(f"Unable to convert {value!r} to int.") from exc
+    Returns:
+        Mean recall@K.
+
+    Raises:
+        ValueError: If *k* is not positive or if inputs are malformed.
+    """
+    if k <= 0:
+        raise ValueError("Parameter 'k' must be a positive integer.")
+    _validate_dataframe(test_interactions, [user_col, item_col])
+
+    gt: Dict = defaultdict(set)
+    for _, row in test_interactions.iterrows():
+        gt[row[user_col]].add(row[item_col])
+
+    recalls = []
+    for user, recs in recommendations.items():
+        relevant = gt.get(user, set())
+        if not relevant:
+            continue
+        top_k = recs[:k]
+        hit_count = sum(1 for item in top_k if item in relevant)
+        recalls.append(hit_count / len(relevant))
+
+    if not recalls:
+        logger.warning("No recommendations to evaluate for recall@%d.", k)
+        return 0.0
+    mean_recall = float(np.mean(recalls))
+    logger.info("Recall@%d = %.4f", k, mean_recall)
+    return mean_recall
+
+
+def train_test_split(
+    ratings: pd.DataFrame,
+    test_ratio: float = 0.2,
+    user_col: str = "user_id",
+    item_col: str = "item_id",
+    rating_col: str = "rating",
+    random_state: int | None = None,
+) -> Tuple[pd.DataFrame, pd.DataFrame]:
+    """
+    Split the rating data into train and test sets while preserving each
+    user's interactions.
+
+    Args:
+        ratings: Full rating DataFrame.
+        test_ratio: Fraction of each user's interactions to allocate to test.
+        user_col: Column name for users.
+        item_col: Column name for items.
+        rating_col: Column name for rating values.
+        random_state: Seed for reproducibility.
+
+    Returns:
+        A tuple ``(train_df, test_df)``.
+
+    Raises:
+        ValueError: If *test_ratio* is not between 0 and 1.
+    """
+    if not (0.0 < test_ratio < 1.0):
+        raise ValueError("test_ratio must be between 0 and 1 (exclusive).")
+    _validate_dataframe(ratings, [user_col, item_col, rating_col])
+
+    rng = np.random.default_rng(random_state)
+    train_frames = []
+    test_frames = []
+
+    logger.debug("Performing stratified train/test split with ratio %.2f.", test_ratio)
+    for user, group in ratings.groupby(user_col):
+        n_total = len(group)
+        n_test = max(1, int(np.floor(test_ratio * n_total)))
+        shuffled = group.sample(frac=1, random_state=rng.integers(0, 2**32 - 1))
+        test_frames.append(shuffled.iloc[:n_test])
+        train_frames.append(shuffled.iloc[n_test:])
+
+    train_df = pd.concat(train_frames).reset_index(drop=True)
+    test_df = pd.concat(test_frames).reset_index(drop=True)
+
+    logger.info(
+        "Split data into %d training and %d testing interactions.",
+        len(train_df),
+        len(test_df),
+    )
+    return train_df, test_df

@@ -1,482 +1,525 @@
 """
-A minimal blog Content Management System (CMS) built with Flask.
+blog_cms.py
 
-Features:
-- User registration and authentication (Flask-Login)
-- CRUD for blog posts
-- Comment system
-- Categories and tags (many‑to‑many)
-- Input validation (WTForms) and CSRF protection
-- SQLite storage via SQLAlchemy
+A lightweight, self‑contained blog content management system (CMS) supporting:
+
+* User registration and authentication with secure password hashing (bcrypt).
+* CRUD operations for posts, including categories and tags.
+* Comment creation and retrieval.
+* Simple in‑memory session token handling.
+
+All data is persisted in a SQLite database using parameterised queries to
+prevent SQL injection. The module relies only on the Python standard library
+and the widely‑used ``bcrypt`` package.
 """
 
 from __future__ import annotations
 
-import os
-import datetime as dt
-from typing import List, Optional
+import datetime
+import hashlib
+import secrets
+import sqlite3
+import threading
+from dataclasses import dataclass
+from typing import Any, Dict, List, Optional, Sequence, Tuple
 
-from flask import (
-    Flask,
-    render_template,
-    request,
-    redirect,
-    url_for,
-    flash,
-    abort,
-    session,
-)
-from flask_sqlalchemy import SQLAlchemy
-from flask_login import (
-    LoginManager,
-    UserMixin,
-    login_user,
-    logout_user,
-    current_user,
-    login_required,
-)
-from flask_wtf import FlaskForm, CSRFProtect
-from wtforms import StringField, PasswordField, TextAreaField, SelectMultipleField, SubmitField
-from wtforms.validators import DataRequired, Length, Email, ValidationError, EqualTo
-from werkzeug.security import generate_password_hash, check_password_hash
+import bcrypt  # type: ignore[import]
 
 # --------------------------------------------------------------------------- #
-# Flask app and extensions initialization
+# Exceptions
 # --------------------------------------------------------------------------- #
-app = Flask(__name__)
-app.config["SECRET_KEY"] = os.getenv("FLASK_SECRET_KEY", "dev-secret-key")
-app.config["SQLALCHEMY_DATABASE_URI"] = os.getenv(
-    "DATABASE_URL", "sqlite:///blog.db"
-)
-app.config["SQLALCHEMY_TRACK_MODIFICATIONS"] = False
 
-db = SQLAlchemy(app)
-login_manager = LoginManager(app)
-login_manager.login_view = "login"
-csrf = CSRFProtect(app)
+
+class BlogError(Exception):
+    """Base class for all blog CMS errors."""
+
+
+class AuthenticationError(BlogError):
+    """Raised when authentication fails."""
+
+
+class AuthorizationError(BlogError):
+    """Raised when a user attempts an operation they are not permitted to perform."""
+
+
+class NotFoundError(BlogError):
+    """Raised when a requested resource does not exist."""
 
 
 # --------------------------------------------------------------------------- #
-# Database models
+# Data models
 # --------------------------------------------------------------------------- #
-post_tags = db.Table(
-    "post_tags",
-    db.Column("post_id", db.Integer, db.ForeignKey("post.id"), primary_key=True),
-    db.Column("tag_id", db.Integer, db.ForeignKey("tag.id"), primary_key=True),
-)
 
 
-class User(UserMixin, db.Model):
-    """User model for authentication."""
+@dataclass(frozen=True)
+class User:
+    """Simple user representation."""
 
-    __tablename__ = "user"
-    id: int = db.Column(db.Integer, primary_key=True)
-    username: str = db.Column(db.String(80), unique=True, nullable=False)
-    email: str = db.Column(db.String(120), unique=True, nullable=False)
-    password_hash: str = db.Column(db.String(128), nullable=False)
-    is_admin: bool = db.Column(db.Boolean, default=False)
-
-    posts: List["Post"] = db.relationship("Post", backref="author", lazy="dynamic")
-    comments: List["Comment"] = db.relationship(
-        "Comment", backref="author", lazy="dynamic"
-    )
-
-    def set_password(self, password: str) -> None:
-        """Hash and store password."""
-        self.password_hash = generate_password_hash(password)
-
-    def check_password(self, password: str) -> bool:
-        """Validate password against stored hash."""
-        return check_password_hash(self.password_hash, password)
+    id: int
+    username: str
 
 
-class Category(db.Model):
-    """Post category (one‑to‑many)."""
+@dataclass(frozen=True)
+class Post:
+    """Simple post representation."""
 
-    __tablename__ = "category"
-    id: int = db.Column(db.Integer, primary_key=True)
-    name: str = db.Column(db.String(50), unique=True, nullable=False)
-
-    posts: List["Post"] = db.relationship("Post", backref="category", lazy="dynamic")
-
-
-class Tag(db.Model):
-    """Tag model for many‑to‑many relationship with posts."""
-
-    __tablename__ = "tag"
-    id: int = db.Column(db.Integer, primary_key=True)
-    name: str = db.Column(db.String(30), unique=True, nullable=False)
+    id: int
+    author_id: int
+    title: str
+    content: str
+    created_at: datetime.datetime
+    updated_at: datetime.datetime
+    categories: List[str]
+    tags: List[str]
 
 
-class Post(db.Model):
-    """Blog post model."""
+@dataclass(frozen=True)
+class Comment:
+    """Simple comment representation."""
 
-    __tablename__ = "post"
-    id: int = db.Column(db.Integer, primary_key=True)
-    title: str = db.Column(db.String(200), nullable=False)
-    body: str = db.Column(db.Text, nullable=False)
-    created_at: dt.datetime = db.Column(
-        db.DateTime, default=dt.datetime.utcnow, nullable=False
-    )
-    updated_at: dt.datetime = db.Column(
-        db.DateTime, default=dt.datetime.utcnow, onupdate=dt.datetime.utcnow
-    )
-    author_id: int = db.Column(db.Integer, db.ForeignKey("user.id"), nullable=False)
-    category_id: Optional[int] = db.Column(
-        db.Integer, db.ForeignKey("category.id")
-    )
-
-    tags: List[Tag] = db.relationship(
-        "Tag", secondary=post_tags, lazy="subquery", backref=db.backref("posts", lazy=True)
-    )
-    comments: List["Comment"] = db.relationship(
-        "Comment", backref="post", lazy="dynamic", cascade="all, delete-orphan"
-    )
-
-
-class Comment(db.Model):
-    """Comment model attached to a post."""
-
-    __tablename__ = "comment"
-    id: int = db.Column(db.Integer, primary_key=True)
-    body: str = db.Column(db.Text, nullable=False)
-    created_at: dt.datetime = db.Column(
-        db.DateTime, default=dt.datetime.utcnow, nullable=False
-    )
-    author_id: int = db.Column(db.Integer, db.ForeignKey("user.id"), nullable=False)
-    post_id: int = db.Column(db.Integer, db.ForeignKey("post.id"), nullable=False)
+    id: int
+    post_id: int
+    author_id: int
+    content: str
+    created_at: datetime.datetime
 
 
 # --------------------------------------------------------------------------- #
-# Flask‑Login loader
+# Core CMS implementation
 # --------------------------------------------------------------------------- #
-@login_manager.user_loader
-def load_user(user_id: str) -> Optional[User]:
-    return User.query.get(int(user_id))
 
 
-# --------------------------------------------------------------------------- #
-# Forms
-# --------------------------------------------------------------------------- #
-class RegistrationForm(FlaskForm):
-    """User registration form."""
+class BlogCMS:
+    """
+    Blog content management system.
 
-    username = StringField(
-        "Username",
-        validators=[DataRequired(), Length(min=3, max=25)],
-        render_kw={"autocomplete": "username"},
-    )
-    email = StringField(
-        "Email",
-        validators=[DataRequired(), Email()],
-        render_kw={"autocomplete": "email"},
-    )
-    password = PasswordField(
-        "Password",
-        validators=[DataRequired(), Length(min=6)],
-        render_kw={"autocomplete": "new-password"},
-    )
-    confirm = PasswordField(
-        "Confirm Password",
-        validators=[DataRequired(), EqualTo("password", message="Passwords must match.")],
-    )
-    submit = SubmitField("Register")
+    All methods raise :class:`BlogError` subclasses on failure.
+    """
 
-    def validate_username(self, field: StringField) -> None:
-        if User.query.filter_by(username=field.data).first():
-            raise ValidationError("Username already taken.")
+    _TOKEN_TTL = datetime.timedelta(hours=2)
 
-    def validate_email(self, field: StringField) -> None:
-        if User.query.filter_by(email=field.data).first():
-            raise ValidationError("Email already registered.")
+    def __init__(self, db_path: str = ":memory:") -> None:
+        """
+        Initialise the CMS, creating tables if they do not exist.
 
+        Args:
+            db_path: Filesystem path to the SQLite database. ``:memory:`` creates
+                a temporary in‑memory database.
+        """
+        self._db_path = db_path
+        self._conn_lock = threading.Lock()
+        self._session_store: Dict[str, Tuple[int, datetime.datetime]] = {}
+        self._initialize_database()
 
-class LoginForm(FlaskForm):
-    """User login form."""
+    # ------------------------------------------------------------------- #
+    # Database utilities
+    # ------------------------------------------------------------------- #
 
-    email = StringField(
-        "Email",
-        validators=[DataRequired(), Email()],
-        render_kw={"autocomplete": "email"},
-    )
-    password = PasswordField(
-        "Password",
-        validators=[DataRequired()],
-        render_kw={"autocomplete": "current-password"},
-    )
-    submit = SubmitField("Login")
+    def _get_connection(self) -> sqlite3.Connection:
+        """Return a new SQLite connection with row factory set to dict."""
+        conn = sqlite3.connect(self._db_path, detect_types=sqlite3.PARSE_DECLTYPES)
+        conn.row_factory = sqlite3.Row
+        return conn
 
+    def _initialize_database(self) -> None:
+        """Create tables required for the CMS."""
+        schema = """
+        CREATE TABLE IF NOT EXISTS users (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            username TEXT UNIQUE NOT NULL,
+            password_hash BLOB NOT NULL
+        );
+        CREATE TABLE IF NOT EXISTS posts (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            author_id INTEGER NOT NULL,
+            title TEXT NOT NULL,
+            content TEXT NOT NULL,
+            created_at TIMESTAMP NOT NULL,
+            updated_at TIMESTAMP NOT NULL,
+            FOREIGN KEY(author_id) REFERENCES users(id) ON DELETE CASCADE
+        );
+        CREATE TABLE IF NOT EXISTS categories (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            name TEXT UNIQUE NOT NULL
+        );
+        CREATE TABLE IF NOT EXISTS tags (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            name TEXT UNIQUE NOT NULL
+        );
+        CREATE TABLE IF NOT EXISTS post_categories (
+            post_id INTEGER NOT NULL,
+            category_id INTEGER NOT NULL,
+            PRIMARY KEY (post_id, category_id),
+            FOREIGN KEY(post_id) REFERENCES posts(id) ON DELETE CASCADE,
+            FOREIGN KEY(category_id) REFERENCES categories(id) ON DELETE CASCADE
+        );
+        CREATE TABLE IF NOT EXISTS post_tags (
+            post_id INTEGER NOT NULL,
+            tag_id INTEGER NOT NULL,
+            PRIMARY KEY (post_id, tag_id),
+            FOREIGN KEY(post_id) REFERENCES posts(id) ON DELETE CASCADE,
+            FOREIGN KEY(tag_id) REFERENCES tags(id) ON DELETE CASCADE
+        );
+        CREATE TABLE IF NOT EXISTS comments (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            post_id INTEGER NOT NULL,
+            author_id INTEGER NOT NULL,
+            content TEXT NOT NULL,
+            created_at TIMESTAMP NOT NULL,
+            FOREIGN KEY(post_id) REFERENCES posts(id) ON DELETE CASCADE,
+            FOREIGN KEY(author_id) REFERENCES users(id) ON DELETE CASCADE
+        );
+        """
+        with self._conn_lock, self._get_connection() as conn:
+            conn.executescript(schema)
 
-class PostForm(FlaskForm):
-    """Create / edit post."""
+    # ------------------------------------------------------------------- #
+    # Authentication helpers
+    # ------------------------------------------------------------------- #
 
-    title = StringField(
-        "Title", validators=[DataRequired(), Length(min=5, max=200)]
-    )
-    body = TextAreaField("Content", validators=[DataRequired(), Length(min=10)])
-    category = StringField("Category", validators=[Length(max=50)])
-    tags = StringField(
-        "Tags (comma separated)", description="Enter tags separated by commas."
-    )
-    submit = SubmitField("Save")
+    @staticmethod
+    def _hash_password(password: str) -> bytes:
+        """
+        Hash a plaintext password using bcrypt.
 
+        Args:
+            password: Plaintext password.
 
-class CommentForm(FlaskForm):
-    """Add a comment."""
+        Returns:
+            A bcrypt hash.
+        """
+        return bcrypt.hashpw(password.encode("utf-8"), bcrypt.gensalt())
 
-    body = TextAreaField(
-        "Comment", validators=[DataRequired(), Length(min=1, max=1000)]
-    )
-    submit = SubmitField("Post Comment")
+    @staticmethod
+    def _verify_password(password: str, hashed: bytes) -> bool:
+        """
+        Verify a plaintext password against a stored bcrypt hash.
 
+        Args:
+            password: Plaintext password.
+            hashed: Stored bcrypt hash.
 
-# --------------------------------------------------------------------------- #
-# Helper utilities
-# --------------------------------------------------------------------------- #
-def _get_or_create_tag(name: str) -> Tag:
-    tag = Tag.query.filter_by(name=name).first()
-    if not tag:
-        tag = Tag(name=name)
-        db.session.add(tag)
-        db.session.flush()
-    return tag
+        Returns:
+            True if the password matches, False otherwise.
+        """
+        return bcrypt.checkpw(password.encode("utf-8"), hashed)
 
+    def register_user(self, username: str, password: str) -> int:
+        """
+        Register a new user.
 
-def _parse_tags(tag_string: str) -> List[Tag]:
-    """Parse comma‑separated tags."""
-    tags = []
-    for raw in tag_string.split(","):
-        name = raw.strip().lower()
-        if name:
-            tags.append(_get_or_create_tag(name))
-    return tags
+        Args:
+            username: Desired username (must be unique).
+            password: Plaintext password.
 
+        Returns:
+            The newly created user's ID.
 
-def _get_or_create_category(name: str) -> Optional[Category]:
-    if not name:
-        return None
-    name = name.strip()
-    category = Category.query.filter_by(name=name).first()
-    if not category:
-        category = Category(name=name)
-        db.session.add(category)
-        db.session.flush()
-    return category
+        Raises:
+            BlogError: If the username already exists or database error occurs.
+        """
+        if not username or not password:
+            raise BlogError("Username and password cannot be empty.")
+        password_hash = self._hash_password(password)
+        query = "INSERT INTO users (username, password_hash) VALUES (?, ?);"
+        with self._conn_lock, self._get_connection() as conn:
+            try:
+                cur = conn.execute(query, (username, password_hash))
+                return cur.lastrowid
+            except sqlite3.IntegrityError as exc:
+                raise BlogError(f"Username '{username}' already taken.") from exc
 
+    def login(self, username: str, password: str) -> str:
+        """
+        Authenticate a user and return a session token.
 
-# --------------------------------------------------------------------------- #
-# Routes
-# --------------------------------------------------------------------------- #
-@app.route("/")
-def index() -> str:
-    """Home page – list posts."""
-    posts = (
-        Post.query.order_by(Post.created_at.desc())
-        .options(db.selectinload(Post.author), db.selectinload(Post.tags))
-        .all()
-    )
-    return render_template("index.html", posts=posts)
+        Args:
+            username: User's username.
+            password: Plaintext password.
 
+        Returns:
+            A session token string.
 
-@app.route("/register", methods=["GET", "POST"])
-def register() -> str:
-    """User registration."""
-    if current_user.is_authenticated:
-        return redirect(url_for("index"))
-    form = RegistrationForm()
-    if form.validate_on_submit():
-        user = User(
-            username=form.username.data,
-            email=form.email.data,
+        Raises:
+            AuthenticationError: If credentials are invalid.
+        """
+        query = "SELECT id, password_hash FROM users WHERE username = ?;"
+        with self._conn_lock, self._get_connection() as conn:
+            row = conn.execute(query, (username,)).fetchone()
+        if row is None:
+            raise AuthenticationError("Invalid username or password.")
+        if not self._verify_password(password, row["password_hash"]):
+            raise AuthenticationError("Invalid username or password.")
+        token = secrets.token_urlsafe(32)
+        expiry = datetime.datetime.utcnow() + self._TOKEN_TTL
+        self._session_store[token] = (row["id"], expiry)
+        return token
+
+    def _validate_token(self, token: str) -> int:
+        """
+        Validate a session token and return the associated user ID.
+
+        Args:
+            token: Session token.
+
+        Returns:
+            User ID linked to the token.
+
+        Raises:
+            AuthenticationError: If token is missing, expired, or invalid.
+        """
+        if token not in self._session_store:
+            raise AuthenticationError("Invalid session token.")
+        user_id, expiry = self._session_store[token]
+        if datetime.datetime.utcnow() > expiry:
+            del self._session_store[token]
+            raise AuthenticationError("Session token has expired.")
+        # Refresh expiry
+        self._session_store[token] = (user_id, datetime.datetime.utcnow() + self._TOKEN_TTL)
+        return user_id
+
+    # ------------------------------------------------------------------- #
+    # Post management
+    # ------------------------------------------------------------------- #
+
+    def create_post(
+        self,
+        token: str,
+        title: str,
+        content: str,
+        categories: Optional[Sequence[str]] = None,
+        tags: Optional[Sequence[str]] = None,
+    ) -> int:
+        """
+        Create a new blog post.
+
+        Args:
+            token: Valid session token of the author.
+            title: Post title.
+            content: Post body/content.
+            categories: Optional list of category names.
+            tags: Optional list of tag names.
+
+        Returns:
+            The newly created post's ID.
+
+        Raises:
+            AuthenticationError: If token is invalid.
+            BlogError: If title/content are empty or DB error occurs.
+        """
+        author_id = self._validate_token(token)
+        if not title.strip() or not content.strip():
+            raise BlogError("Title and content cannot be empty.")
+        now = datetime.datetime.utcnow()
+        insert_post = """
+            INSERT INTO posts (author_id, title, content, created_at, updated_at)
+            VALUES (?, ?, ?, ?, ?);
+        """
+        with self._conn_lock, self._get_connection() as conn:
+            cur = conn.execute(insert_post, (author_id, title, content, now, now))
+            post_id = cur.lastrowid
+            self._associate_categories(conn, post_id, categories or [])
+            self._associate_tags(conn, post_id, tags or [])
+            conn.commit()
+        return post_id
+
+    def _get_or_create_category(self, conn: sqlite3.Connection, name: str) -> int:
+        """Return the ID of a category, creating it if necessary."""
+        name = name.strip().lower()
+        cur = conn.execute("SELECT id FROM categories WHERE name = ?;", (name,))
+        row = cur.fetchone()
+        if row:
+            return row["id"]
+        cur = conn.execute("INSERT INTO categories (name) VALUES (?);", (name,))
+        return cur.lastrowid
+
+    def _get_or_create_tag(self, conn: sqlite3.Connection, name: str) -> int:
+        """Return the ID of a tag, creating it if necessary."""
+        name = name.strip().lower()
+        cur = conn.execute("SELECT id FROM tags WHERE name = ?;", (name,))
+        row = cur.fetchone()
+        if row:
+            return row["id"]
+        cur = conn.execute("INSERT INTO tags (name) VALUES (?);", (name,))
+        return cur.lastrowid
+
+    def _associate_categories(
+        self, conn: sqlite3.Connection, post_id: int, categories: Sequence[str]
+    ) -> None:
+        """Link a post to the supplied categories."""
+        for cat in categories:
+            cat_id = self._get_or_create_category(conn, cat)
+            conn.execute(
+                "INSERT OR IGNORE INTO post_categories (post_id, category_id) VALUES (?, ?);",
+                (post_id, cat_id),
+            )
+
+    def _associate_tags(self, conn: sqlite3.Connection, post_id: int, tags: Sequence[str]) -> None:
+        """Link a post to the supplied tags."""
+        for tag in tags:
+            tag_id = self._get_or_create_tag(conn, tag)
+            conn.execute(
+                "INSERT OR IGNORE INTO post_tags (post_id, tag_id) VALUES (?, ?);",
+                (post_id, tag_id),
+            )
+
+    def read_post(self, post_id: int) -> Post:
+        """
+        Retrieve a post by its ID.
+
+        Args:
+            post_id: Identifier of the post.
+
+        Returns:
+            A :class:`Post` dataclass instance.
+
+        Raises:
+            NotFoundError: If the post does not exist.
+        """
+        post_query = """
+            SELECT * FROM posts WHERE id = ?;
+        """
+        with self._conn_lock, self._get_connection() as conn:
+            row = conn.execute(post_query, (post_id,)).fetchone()
+            if row is None:
+                raise NotFoundError(f"Post with id {post_id} not found.")
+            categories = self._fetch_post_categories(conn, post_id)
+            tags = self._fetch_post_tags(conn, post_id)
+        return Post(
+            id=row["id"],
+            author_id=row["author_id"],
+            title=row["title"],
+            content=row["content"],
+            created_at=row["created_at"],
+            updated_at=row["updated_at"],
+            categories=categories,
+            tags=tags,
         )
-        user.set_password(form.password.data)
-        db.session.add(user)
-        db.session.commit()
-        flash("Registration successful, you can now log in.", "success")
-        return redirect(url_for("login"))
-    return render_template("register.html", form=form)
 
+    def _fetch_post_categories(self, conn: sqlite3.Connection, post_id: int) -> List[str]:
+        query = """
+            SELECT c.name FROM categories c
+            JOIN post_categories pc ON c.id = pc.category_id
+            WHERE pc.post_id = ?;
+        """
+        rows = conn.execute(query, (post_id,)).fetchall()
+        return [r["name"] for r in rows]
 
-@app.route("/login", methods=["GET", "POST"])
-def login() -> str:
-    """User login."""
-    if current_user.is_authenticated:
-        return redirect(url_for("index"))
-    form = LoginForm()
-    if form.validate_on_submit():
-        user = User.query.filter_by(email=form.email.data).first()
-        if user and user.check_password(form.password.data):
-            login_user(user)
-            flash("Logged in successfully.", "success")
-            next_page = request.args.get("next")
-            return redirect(next_page or url_for("index"))
-        flash("Invalid credentials.", "danger")
-    return render_template("login.html", form=form)
+    def _fetch_post_tags(self, conn: sqlite3.Connection, post_id: int) -> List[str]:
+        query = """
+            SELECT t.name FROM tags t
+            JOIN post_tags pt ON t.id = pt.tag_id
+            WHERE pt.post_id = ?;
+        """
+        rows = conn.execute(query, (post_id,)).fetchall()
+        return [r["name"] for r in rows]
 
+    def update_post(
+        self,
+        token: str,
+        post_id: int,
+        title: Optional[str] = None,
+        content: Optional[str] = None,
+        categories: Optional[Sequence[str]] = None,
+        tags: Optional[Sequence[str]] = None,
+    ) -> None:
+        """
+        Update an existing post. Only the author may modify their post.
 
-@app.route("/logout")
-@login_required
-def logout() -> str:
-    """Log the user out."""
-    logout_user()
-    flash("You have been logged out.", "info")
-    return redirect(url_for("index"))
+        Args:
+            token: Session token of the requesting user.
+            post_id: Identifier of the post to update.
+            title: New title (optional).
+            content: New content (optional).
+            categories: New list of categories (optional, replaces existing).
+            tags: New list of tags (optional, replaces existing).
 
+        Raises:
+            AuthenticationError: If token invalid.
+            AuthorizationError: If user is not the author.
+            NotFoundError: If the post does not exist.
+            BlogError: If supplied data is invalid.
+        """
+        user_id = self._validate_token(token)
+        with self._conn_lock, self._get_connection() as conn:
+            post = conn.execute("SELECT * FROM posts WHERE id = ?;", (post_id,)).fetchone()
+            if post is None:
+                raise NotFoundError(f"Post {post_id} not found.")
+            if post["author_id"] != user_id:
+                raise AuthorizationError("You may only edit your own posts.")
+            updates: List[str] = []
+            params: List[Any] = []
+            if title is not None:
+                if not title.strip():
+                    raise BlogError("Title cannot be empty.")
+                updates.append("title = ?")
+                params.append(title)
+            if content is not None:
+                if not content.strip():
+                    raise BlogError("Content cannot be empty.")
+                updates.append("content = ?")
+                params.append(content)
+            if updates:
+                updates.append("updated_at = ?")
+                params.append(datetime.datetime.utcnow())
+                params.append(post_id)
+                sql = f"UPDATE posts SET {', '.join(updates)} WHERE id = ?;"
+                conn.execute(sql, tuple(params))
+            # Replace categories/tags if supplied
+            if categories is not None:
+                conn.execute("DELETE FROM post_categories WHERE post_id = ?;", (post_id,))
+                self._associate_categories(conn, post_id, categories)
+            if tags is not None:
+                conn.execute("DELETE FROM post_tags WHERE post_id = ?;", (post_id,))
+                self._associate_tags(conn, post_id, tags)
+            conn.commit()
 
-@app.route("/post/<int:post_id>")
-def post_detail(post_id: int) -> str:
-    """Show a single post and its comments."""
-    post = (
-        Post.query.filter_by(id=post_id)
-        .options(
-            db.selectinload(Post.author),
-            db.selectinload(Post.tags),
-            db.selectinload(Post.comments).selectinload(Comment.author),
-        )
-        .first_or_404()
-    )
-    comment_form = CommentForm()
-    return render_template(
-        "post_detail.html", post=post, comment_form=comment_form
-    )
+    def delete_post(self, token: str, post_id: int) -> None:
+        """
+        Delete a post. Only the author may delete their post.
 
+        Args:
+            token: Session token of the requesting user.
+            post_id: Identifier of the post to delete.
 
-@app.route("/post/create", methods=["GET", "POST"])
-@login_required
-def post_create() -> str:
-    """Create a new blog post."""
-    form = PostForm()
-    if form.validate_on_submit():
-        category = _get_or_create_category(form.category.data)
-        tags = _parse_tags(form.tags.data)
-        new_post = Post(
-            title=form.title.data,
-            body=form.body.data,
-            author=current_user,
-            category=category,
-        )
-        new_post.tags = tags
-        db.session.add(new_post)
-        db.session.commit()
-        flash("Post created.", "success")
-        return redirect(url_for("post_detail", post_id=new_post.id))
-    return render_template("post_form.html", form=form, action="Create")
+        Raises:
+            AuthenticationError: If token invalid.
+            AuthorizationError: If user is not the author.
+            NotFoundError: If the post does not exist.
+        """
+        user_id = self._validate_token(token)
+        with self._conn_lock, self._get_connection() as conn:
+            post = conn.execute("SELECT author_id FROM posts WHERE id = ?;", (post_id,)).fetchone()
+            if post is None:
+                raise NotFoundError(f"Post {post_id} not found.")
+            if post["author_id"] != user_id:
+                raise AuthorizationError("You may only delete your own posts.")
+            conn.execute("DELETE FROM posts WHERE id = ?;", (post_id,))
+            conn.commit()
 
+    def list_posts(
+        self,
+        category: Optional[str] = None,
+        tag: Optional[str] = None,
+        limit: int = 20,
+        offset: int = 0,
+    ) -> List[Post]:
+        """
+        Retrieve a list of posts, optionally filtered by category or tag.
 
-@app.route("/post/<int:post_id>/edit", methods=["GET", "POST"])
-@login_required
-def post_edit(post_id: int) -> str:
-    """Edit an existing post – only author or admin."""
-    post = Post.query.get_or_404(post_id)
-    if post.author != current_user and not current_user.is_admin:
-        abort(403)
+        Args:
+            category: Category name to filter by.
+            tag: Tag name to filter by.
+            limit: Maximum number of posts to return.
+            offset: Number of posts to skip (for pagination).
 
-    form = PostForm(
-        title=post.title,
-        body=post.body,
-        category=post.category.name if post.category else "",
-        tags=", ".join(tag.name for tag in post.tags),
-    )
-    if form.validate_on_submit():
-        post.title = form.title.data
-        post.body = form.body.data
-        post.category = _get_or_create_category(form.category.data)
-        post.tags = _parse_tags(form.tags.data)
-        db.session.commit()
-        flash("Post updated.", "success")
-        return redirect(url_for("post_detail", post_id=post.id))
-    return render_template("post_form.html", form=form, action="Edit")
+        Returns:
+            List of :class:`Post` objects.
+        """
+        base = "SELECT p.* FROM posts p"
+        joins: List[str] = []
+        conditions: List[str] = []
+        params: List[Any] = []
 
-
-@app.route("/post/<int:post_id>/delete", methods=["POST"])
-@login_required
-def post_delete(post_id: int) -> str:
-    """Delete post – CSRF‑protected."""
-    post = Post.query.get_or_404(post_id)
-    if post.author != current_user and not current_user.is_admin:
-        abort(403)
-    db.session.delete(post)
-    db.session.commit()
-    flash("Post deleted.", "info")
-    return redirect(url_for("index"))
-
-
-@app.route("/post/<int:post_id>/comment", methods=["POST"])
-@login_required
-def add_comment(post_id: int) -> str:
-    """Add a comment to a post."""
-    post = Post.query.get_or_404(post_id)
-    form = CommentForm()
-    if form.validate_on_submit():
-        comment = Comment(
-            body=form.body.data,
-            author=current_user,
-            post=post,
-        )
-        db.session.add(comment)
-        db.session.commit()
-        flash("Comment added.", "success")
-    else:
-        flash("Failed to add comment.", "danger")
-    return redirect(url_for("post_detail", post_id=post.id))
-
-
-# --------------------------------------------------------------------------- #
-# Error handlers
-# --------------------------------------------------------------------------- #
-@app.errorhandler(403)
-def forbidden(error):
-    return render_template("error.html", code=403, message="Forbidden"), 403
-
-
-@app.errorhandler(404)
-def page_not_found(error):
-    return render_template("error.html", code=404, message="Page not found"), 404
-
-
-@app.errorhandler(500)
-def internal_error(error):
-    db.session.rollback()
-    return (
-        render_template("error.html", code=500, message="Internal server error"),
-        500,
-    )
-
-
-# --------------------------------------------------------------------------- #
-# CLI command to initialise the database
-# --------------------------------------------------------------------------- #
-@app.cli.command("init-db")
-def init_db() -> None:
-    """Create database tables."""
-    db.create_all()
-    print("Database initialized.")
-
-
-# --------------------------------------------------------------------------- #
-# Template stubs (normally separate HTML files, kept minimal for demo)
-# --------------------------------------------------------------------------- #
-@app.context_processor
-def inject_now():
-    return {"now": dt.datetime.utcnow()}
-
-
-def _render_template_stub(name: str, **context):
-    """Fallback simple renderer if templates are missing."""
-    return f"<h1>{name}</h1><pre>{context}</pre>"
-
-
-# Monkey‑patch render_template for this single‑file demo.
-# In a real project, proper Jinja2 templates live in a /templates directory.
-render_template = _render_template_stub  # type: ignore
-
-
-# --------------------------------------------------------------------------- #
-# Application entry point
-# --------------------------------------------------------------------------- #
-if __name__ == "__main__":
-    # Ensure the DB file exists before first request.
-    if not os.path.exists("blog.db"):
-        with app.app_context():
-            db.create_all()
-    app.run(debug=True)
+        if category:
+            joins

@@ -1,214 +1,394 @@
-#!/usr/bin/env python3
 """
-A simple URL shortener service built with Flask and SQLAlchemy.
+url_shortener.py
+-----------------
 
-Features:
-- Encode long URLs to short codes.
-- Decode short codes to original URLs.
-- HTTP redirect handling.
-- Click‑through analytics (click count).
-- Input validation, error handling, and basic security checks.
+A minimal URL shortening service built with Flask and SQLite.
+
+Features
+--------
+* Encode a long URL into a short, opaque code.
+* Decode a short code back to its original URL.
+* HTTP redirect endpoint (`/<code>`) that tracks click counts.
+* Statistics endpoint (`/stats/<code>`) returning click count and original URL.
+* Simple error handling with JSON responses.
+* Secure random code generation and basic URL validation.
+
+Dependencies
+------------
+* Flask (pip install Flask)
+
+The module can be run directly to start a development server:
+
+    python -m url_shortener
+
+Security considerations
+------------------------
+* Uses `secrets` for cryptographically‑secure random code generation.
+* Validates that supplied URLs have an HTTP/HTTPS scheme.
+* Stores data in a local SQLite file with parameterised queries to avoid SQL injection.
 """
 
 from __future__ import annotations
 
 import re
+import sqlite3
 import string
-import urllib.parse
-from datetime import datetime
-from typing import Optional
+import secrets
+from typing import Final, Optional, Tuple
 
-from flask import Flask, jsonify, redirect, request, abort, url_for
-from flask_sqlalchemy import SQLAlchemy
-from sqlalchemy.exc import IntegrityError
+from flask import Flask, jsonify, redirect, request, abort, Response
 
-# -------------------- Configuration --------------------
-BASE62_ALPHABET = string.digits + string.ascii_uppercase + string.ascii_lowercase
-SHORT_CODE_LENGTH = 6  # fallback length for random codes
+# --------------------------------------------------------------------------- #
+# Configuration constants
+# --------------------------------------------------------------------------- #
+
+DB_PATH: Final[str] = "url_shortener.db"
+CODE_LENGTH: Final[int] = 6
+CODE_ALPHABET: Final[str] = string.ascii_letters + string.digits
+URL_REGEX: Final[re.Pattern] = re.compile(
+    r"^(?:http|https)://"
+    r"(?:[A-Z0-9](?:[A-Z0-9-]{0,61}[A-Z0-9])?\.)+"  # domain...
+    r"[A-Z]{2,6}\.?|"
+    r"localhost|"
+    r"\d{1,3}(?:\.\d{1,3}){3})"  # ...or IPv4
+    r"(?::\d+)?"
+    r"(?:/?|[/?]\S+)$",
+    re.IGNORECASE,
+)
+
+# --------------------------------------------------------------------------- #
+# Flask application
+# --------------------------------------------------------------------------- #
 
 app = Flask(__name__)
-app.config["SQLALCHEMY_DATABASE_URI"] = "sqlite:///shortener.db"
-app.config["SQLALCHEMY_TRACK_MODIFICATIONS"] = False
-app.config["SECRET_KEY"] = "replace-this-with-a-secure-random-value"
 
-db = SQLAlchemy(app)
-
-
-# -------------------- Models --------------------
-class URLMap(db.Model):
-    """Database model that maps a short code to a long URL and tracks clicks."""
-
-    __tablename__ = "url_map"
-
-    id = db.Column(db.Integer, primary_key=True)
-    long_url = db.Column(db.String(2048), nullable=False, unique=True)
-    short_code = db.Column(db.String(10), nullable=False, unique=True, index=True)
-    click_count = db.Column(db.Integer, default=0, nullable=False)
-    created_at = db.Column(db.DateTime, default=datetime.utcnow, nullable=False)
-
-    def __repr__(self) -> str:
-        return f"<URLMap {self.short_code} → {self.long_url}>"
+# --------------------------------------------------------------------------- #
+# Custom exceptions
+# --------------------------------------------------------------------------- #
 
 
-# -------------------- Utilities --------------------
-def is_valid_url(url: str) -> bool:
+class URLShortenerError(Exception):
+    """Base class for all URL shortener related errors."""
+
+    def __init__(self, message: str, status_code: int = 400) -> None:
+        super().__init__(message)
+        self.message = message
+        self.status_code = status_code
+
+
+class URLValidationError(URLShortenerError):
+    """Raised when a supplied URL fails validation."""
+
+
+class CodeNotFoundError(URLShortenerError):
+    """Raised when a short code does not exist in the database."""
+
+
+# --------------------------------------------------------------------------- #
+# Database helpers
+# --------------------------------------------------------------------------- #
+
+
+def _get_connection() -> sqlite3.Connection:
+    """Return a new SQLite connection with row factory set to dict.
+
+    Returns
+    -------
+    sqlite3.Connection
+        A connection object to the SQLite database.
     """
-    Validate a URL to ensure it is absolute, uses http/https,
-    and does not point to a private network address.
+    conn = sqlite3.connect(DB_PATH, detect_types=sqlite3.PARSE_DECLTYPES)
+    conn.row_factory = sqlite3.Row
+    return conn
+
+
+def init_db() -> None:
+    """Initialise the SQLite database schema if it does not already exist."""
+    sql = """
+    CREATE TABLE IF NOT EXISTS urls (
+        code TEXT PRIMARY KEY,
+        long_url TEXT NOT NULL,
+        click_count INTEGER NOT NULL DEFAULT 0
+    );
     """
-    parsed = urllib.parse.urlparse(url)
-    if parsed.scheme not in {"http", "https"}:
-        return False
-    if not parsed.netloc:
-        return False
-
-    # Prevent URLs that resolve to private IP ranges.
-    # This is a simple regex check; for production consider more robust validation.
-    private_net_regex = re.compile(
-        r"(^127\.)|(^10\.)|(^172\.(1[6-9]|2[0-9]|3[0-1])\.)|(^192\.168\.)"
-    )
-    host = parsed.hostname or ""
-    if private_net_regex.match(host):
-        return False
-    return True
+    with _get_connection() as conn:
+        conn.executescript(sql)
 
 
-def base62_encode(num: int) -> str:
-    """Encode an integer to a base62 string."""
-    if num == 0:
-        return BASE62_ALPHABET[0]
-    digits = []
-    base = len(BASE62_ALPHABET)
-    while num:
-        num, rem = divmod(num, base)
-        digits.append(BASE62_ALPHABET[rem])
-    return "".join(reversed(digits))
+# --------------------------------------------------------------------------- #
+# Core functionality
+# --------------------------------------------------------------------------- #
 
 
-def generate_short_code(map_id: int) -> str:
+def _is_valid_url(url: str) -> bool:
+    """Return ``True`` if *url* appears to be a well‑formed HTTP/HTTPS URL.
+
+    Parameters
+    ----------
+    url: str
+        The URL to validate.
+
+    Returns
+    -------
+    bool
+        ``True`` if the URL matches a permissive regex, ``False`` otherwise.
     """
-    Generate a deterministic short code from the database primary key.
-    Pad to a minimum length if needed.
+    return bool(URL_REGEX.match(url))
+
+
+def _generate_unique_code(conn: sqlite3.Connection) -> str:
+    """Generate a random, unique short code.
+
+    This function retries until a non‑existing code is produced.
+
+    Parameters
+    ----------
+    conn: sqlite3.Connection
+        An open SQLite connection used to check for collisions.
+
+    Returns
+    -------
+    str
+        A unique short code of length :data:`CODE_LENGTH`.
     """
-    code = base62_encode(map_id)
-    if len(code) < SHORT_CODE_LENGTH:
-        code = code.rjust(SHORT_CODE_LENGTH, BASE62_ALPHABET[0])
-    return code
+    while True:
+        code = "".join(secrets.choice(CODE_ALPHABET) for _ in range(CODE_LENGTH))
+        cur = conn.execute("SELECT 1 FROM urls WHERE code = ?", (code,))
+        if not cur.fetchone():
+            return code
 
 
-# -------------------- Routes --------------------
-@app.route("/shorten", methods=["POST"])
-def shorten_url() -> tuple[dict, int]:
+def encode_url(long_url: str) -> str:
+    """Encode *long_url* into a short code and store the mapping.
+
+    Parameters
+    ----------
+    long_url: str
+        The original URL to shorten.
+
+    Returns
+    -------
+    str
+        The generated short code.
+
+    Raises
+    ------
+    URLValidationError
+        If *long_url* is not a valid HTTP/HTTPS URL.
+    URLShortenerError
+        For unexpected database errors.
     """
-    Create a short URL for a given long URL.
-    Expected JSON payload: {"url": "https://example.com"}
-    Returns JSON with the short URL.
-    """
-    data = request.get_json(silent=True)
-    if not data or "url" not in data:
-        return jsonify(error="Missing 'url' in request body."), 400
+    if not _is_valid_url(long_url):
+        raise URLValidationError("Provided URL is not a valid HTTP/HTTPS URL.", 400)
 
-    long_url = data["url"].strip()
-    if not is_valid_url(long_url):
-        return jsonify(error="Invalid URL provided."), 400
-
-    # Check if URL already exists
-    existing = URLMap.query.filter_by(long_url=long_url).first()
-    if existing:
-        short_url = url_for("redirect_short", short_code=existing.short_code, _external=True)
-        return jsonify(short_url=short_url), 200
-
-    # Create a new mapping; short_code is generated after commit (to get ID)
-    new_map = URLMap(long_url=long_url, short_code="")  # placeholder
-    db.session.add(new_map)
     try:
-        db.session.commit()
-    except IntegrityError:
-        db.session.rollback()
-        return jsonify(error="Database error while storing the URL."), 500
+        with _get_connection() as conn:
+            code = _generate_unique_code(conn)
+            conn.execute(
+                "INSERT INTO urls (code, long_url) VALUES (?, ?)", (code, long_url)
+            )
+            conn.commit()
+            return code
+    except sqlite3.DatabaseError as exc:
+        raise URLShortenerError(f"Database error: {exc}", 500) from exc
 
-    # Generate deterministic short code from ID
-    new_map.short_code = generate_short_code(new_map.id)
+
+def decode_url(code: str) -> str:
+    """Return the original URL associated with *code*.
+
+    Parameters
+    ----------
+    code: str
+        The short code to look up.
+
+    Returns
+    -------
+    str
+        The original long URL.
+
+    Raises
+    ------
+    CodeNotFoundError
+        If *code* does not exist.
+    URLShortenerError
+        For unexpected database errors.
+    """
     try:
-        db.session.commit()
-    except IntegrityError:
-        db.session.rollback()
-        return jsonify(error="Collision occurred while generating short code."), 500
+        with _get_connection() as conn:
+            cur = conn.execute(
+                "SELECT long_url FROM urls WHERE code = ?", (code,)
+            )
+            row = cur.fetchone()
+            if row is None:
+                raise CodeNotFoundError(f"Code '{code}' not found.", 404)
+            return row["long_url"]
+    except sqlite3.DatabaseError as exc:
+        raise URLShortenerError(f"Database error: {exc}", 500) from exc
 
-    short_url = url_for("redirect_short", short_code=new_map.short_code, _external=True)
-    return jsonify(short_url=short_url), 201
 
+def increment_click(code: str) -> None:
+    """Atomically increment the click counter for *code*.
 
-@app.route("/<string:short_code>", methods=["GET"])
-def redirect_short(short_code: str):
+    Parameters
+    ----------
+    code: str
+        Short code whose click count should be increased.
+
+    Raises
+    ------
+    CodeNotFoundError
+        If *code* does not exist.
+    URLShortenerError
+        For unexpected database errors.
     """
-    Redirect a short code to its original long URL.
-    Increments the click counter atomically.
-    """
-    mapping: Optional[URLMap] = URLMap.query.filter_by(short_code=short_code).first()
-    if not mapping:
-        abort(404, description="Short URL not found.")
-
-    # Increment click count in a safe way
-    mapping.click_count += 1
     try:
-        db.session.commit()
-    except Exception:
-        db.session.rollback()
-        # Non‑critical failure; continue with redirect
+        with _get_connection() as conn:
+            cur = conn.execute(
+                "UPDATE urls SET click_count = click_count + 1 WHERE code = ?",
+                (code,),
+            )
+            if cur.rowcount == 0:
+                raise CodeNotFoundError(f"Code '{code}' not found.", 404)
+            conn.commit()
+    except sqlite3.DatabaseError as exc:
+        raise URLShortenerError(f"Database error: {exc}", 500) from exc
 
-    return redirect(mapping.long_url, code=302)
 
+def get_click_count(code: str) -> Tuple[int, str]:
+    """Retrieve click count and original URL for *code*.
 
-@app.route("/analytics/<string:short_code>", methods=["GET"])
-def analytics(short_code: str):
+    Parameters
+    ----------
+    code: str
+        The short code to query.
+
+    Returns
+    -------
+    Tuple[int, str]
+        A tuple ``(click_count, long_url)``.
+
+    Raises
+    ------
+    CodeNotFoundError
+        If *code* does not exist.
+    URLShortenerError
+        For unexpected database errors.
     """
-    Retrieve click analytics for a given short code.
-    Returns JSON with click count and creation timestamp.
-    """
-    mapping: Optional[URLMap] = URLMap.query.filter_by(short_code=short_code).first()
-    if not mapping:
-        abort(404, description="Short URL not found.")
-
-    return jsonify(
-        short_code=mapping.short_code,
-        long_url=mapping.long_url,
-        click_count=mapping.click_count,
-        created_at=mapping.created_at.isoformat(),
-    ), 200
+    try:
+        with _get_connection() as conn:
+            cur = conn.execute(
+                "SELECT click_count, long_url FROM urls WHERE code = ?", (code,)
+            )
+            row = cur.fetchone()
+            if row is None:
+                raise CodeNotFoundError(f"Code '{code}' not found.", 404)
+            return row["click_count"], row["long_url"]
+    except sqlite3.DatabaseError as exc:
+        raise URLShortenerError(f"Database error: {exc}", 500) from exc
 
 
-# -------------------- Error Handlers --------------------
-@app.errorhandler(400)
-def bad_request(error):
-    return jsonify(error=str(error)), 400
+# --------------------------------------------------------------------------- #
+# Flask route implementations
+# --------------------------------------------------------------------------- #
+
+
+@app.errorhandler(URLShortenerError)
+def handle_url_shortener_error(error: URLShortenerError) -> Response:
+    """Convert custom exceptions into JSON error responses."""
+    response = jsonify({"error": error.message})
+    response.status_code = error.status_code
+    return response
 
 
 @app.errorhandler(404)
-def not_found(error):
-    return jsonify(error=str(error)), 404
+def handle_404(_: Exception) -> Response:
+    """Return a JSON 404 for unknown routes."""
+    response = jsonify({"error": "Resource not found"})
+    response.status_code = 404
+    return response
 
 
-@app.errorhandler(500)
-def internal_error(error):
-    return jsonify(error="Internal server error."), 500
+@app.route("/encode", methods=["POST"])
+def encode_endpoint() -> Response:
+    """Encode endpoint: expects JSON ``{'url': '<long_url>'}``.
 
-
-# -------------------- CLI Utilities --------------------
-@app.cli.command("init-db")
-def init_db() -> None:
+    Returns
+    -------
+    Response
+        JSON ``{'code': '<short_code>'}`` on success.
     """
-    Flask CLI command to initialize the SQLite database.
-    Usage: flask init-db
+    if not request.is_json:
+        raise URLShortenerError("Request body must be JSON.", 415)
+
+    data = request.get_json()
+    if not isinstance(data, dict) or "url" not in data:
+        raise URLShortenerError("JSON must contain a 'url' field.", 400)
+
+    long_url = data["url"]
+    if not isinstance(long_url, str):
+        raise URLShortenerError("'url' field must be a string.", 400)
+
+    code = encode_url(long_url)
+    return jsonify({"code": code}), 201
+
+
+@app.route("/<code>", methods=["GET"])
+def redirect_endpoint(code: str) -> Response:
+    """Redirect endpoint that forwards the client to the original URL.
+
+    Also increments the click counter.
+
+    Parameters
+    ----------
+    code: str
+        The short code extracted from the URL path.
+
+    Returns
+    -------
+    Response
+        A Flask redirect response.
     """
-    db.create_all()
-    print("Database initialized.")
+    long_url = decode_url(code)
+    increment_click(code)
+    return redirect(long_url, code=302)
 
 
-# -------------------- Main --------------------
+@app.route("/stats/<code>", methods=["GET"])
+def stats_endpoint(code: str) -> Response:
+    """Statistics endpoint returning click count and original URL.
+
+    Parameters
+    ----------
+    code: str
+        The short code to query.
+
+    Returns
+    -------
+    Response
+        JSON ``{'url': '<long_url>', 'clicks': <int>}``.
+    """
+    clicks, long_url = get_click_count(code)
+    return jsonify({"url": long_url, "clicks": clicks})
+
+
+# --------------------------------------------------------------------------- #
+# Module entry point
+# --------------------------------------------------------------------------- #
+
+
+def _run_dev_server(host: str = "127.0.0.1", port: int = 5000) -> None:
+    """Start Flask's built‑in development server.
+
+    Parameters
+    ----------
+    host: str, optional
+        Host address to bind to (default ``127.0.0.1``).
+    port: int, optional
+        Port number (default ``5000``).
+    """
+    init_db()
+    app.run(host=host, port=port, debug=False)
+
+
 if __name__ == "__main__":
-    # Ensure DB tables exist before first request
-    with app.app_context():
-        db.create_all()
-    # In production, use a proper WSGI server (e.g., gunicorn) and disable debug mode.
-    app.run(host="0.0.0.0", port=5000, debug=False)
+    _run_dev_server()
