@@ -44,5 +44,13 @@
   "gi": "pygobject",
   "lxml": "lxml",
   "zmq": "pyzmq",
-  "wx": "wxpython"
+  "wx": "wxpython",
+  "flask_bcrypt": "flask-bcrypt",
+  "flask_wtf": "flask-wtf",
+  "flask_socketio": "flask-socketio",
+  "flask_session": "flask-session",
+  "flask_marshmallow": "flask-marshmallow",
+  "flask_migrate": "flask-migrate",
+  "flask_cors": "flask-cors",
+  "flask_restful": "flask-restful"
 }
