@@ -1,0 +1,11 @@
+{
+  "model": "nvidia/nemotron-3-ultra-550b-a55b",
+  "task": "task01",
+  "run": 3,
+  "collected_at": "2026-07-20",
+  "model_version": "nvidia/nemotron-3-ultra-550b-a55b",
+  "temperature": 0.7,
+  "max_tokens": 4096,
+  "truncated": false,
+  "n_lines": 437
+}

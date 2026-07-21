@@ -1,0 +1,151 @@
+from openai import OpenAI
+
+client = OpenAI(
+  base_url = "https://integrate.api.nvidia.com/v1",
+  api_key = "REDACTED_NVIDIA_KEY"
+)
+
+
+completion = client.chat.completions.create(
+  model="deepseek-ai/deepseek-v4-pro",
+  messages=[{"role":"user","content":""}],
+  temperature=1,
+  top_p=0.95,
+  max_tokens=16384,
+  extra_body={"chat_template_kwargs":{"thinking":False}},
+  stream=False
+)
+
+print(completion.choices[0].message.content)
+
+
+
+
+import requests
+
+invoke_url = "https://integrate.api.nvidia.com/v1/chat/completions"
+stream = False
+
+headers = {
+    "Authorization": "Bearer REDACTED_NVIDIA_KEY",
+    "Accept": "text/event-stream" if stream else "application/json",
+}
+
+payload = {
+  "messages": [
+    {
+      "role": "user",
+      "content": ""
+    }
+  ],
+  "model": "qwen/qwen3.5-397b-a17b",
+  "max_tokens": 16384,
+  "stream": stream,
+  "temperature": 0.6,
+  "top_p": 0.95,
+  "top_k": 20,
+  "presence_penalty": 0,
+  "repetition_penalty": 1
+}
+
+response = requests.post(invoke_url, headers=headers, json=payload, stream=stream)
+if stream:
+    for line in response.iter_lines():
+        if line:
+            print(line.decode("utf-8"))
+else:
+    print(response.json())
+
+
+
+
+import requests
+
+invoke_url = "https://integrate.api.nvidia.com/v1/chat/completions"
+stream = False
+
+headers = {
+    "Authorization": "Bearer REDACTED_NVIDIA_KEY",
+    "Accept": "text/event-stream" if stream else "application/json",
+}
+
+payload = {
+  "messages": [
+    {
+      "role": "user",
+      "content": ""
+    }
+  ],
+  "model": "moonshotai/kimi-k2.6",
+  "max_tokens": 16384,
+  "seed": 0,
+  "stream": stream,
+  "temperature": 1,
+  "top_p": 1
+}
+
+response = requests.post(invoke_url, headers=headers, json=payload, stream=stream)
+if stream:
+    for line in response.iter_lines():
+        if line:
+            print(line.decode("utf-8"))
+else:
+    print(response.json())
+
+
+
+
+
+from openai import OpenAI
+
+client = OpenAI(
+  base_url = "https://integrate.api.nvidia.com/v1",
+  api_key = "REDACTED_NVIDIA_KEY"
+)
+
+
+completion = client.chat.completions.create(
+  model="nvidia/nemotron-3-ultra-550b-a55b",
+  messages=[{"role":"user","content":""}],
+  temperature=1,
+  top_p=0.95,
+  max_tokens=16384,
+  extra_body={"chat_template_kwargs":{"enable_thinking":True},"reasoning_budget":16384},
+  stream=True
+)
+
+for chunk in completion:
+  if not chunk.choices:
+    continue
+  reasoning = getattr(chunk.choices[0].delta, "reasoning_content", None)
+  if reasoning:
+    print(reasoning, end="")
+  if chunk.choices[0].delta.content is not None:
+    print(chunk.choices[0].delta.content, end="")
+
+
+
+
+
+
+
+from openai import OpenAI
+
+client = OpenAI(
+  base_url = "https://integrate.api.nvidia.com/v1",
+  api_key = "REDACTED_NVIDIA_KEY"
+)
+
+completion = client.chat.completions.create(
+  model="openai/gpt-oss-120b",
+  messages=[{"role":"user","content":""}],
+  temperature=1,
+  top_p=1,
+  max_tokens=4096,
+  stream=False
+)
+
+reasoning = getattr(completion.choices[0].message, "reasoning_content", None)
+if reasoning:
+  print(reasoning)
+print(completion.choices[0].message.content)

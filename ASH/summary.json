@@ -1,0 +1,156 @@
+{
+  "total_jobs": 42,
+  "success": 22,
+  "failures": 20,
+  "failure_list": [
+    {
+      "task": "task07",
+      "model": "deepseek-ai/deepseek-v4-pro",
+      "run": 2,
+      "error": "timeout (skipped)"
+    },
+    {
+      "task": "task13",
+      "model": "deepseek-ai/deepseek-v4-pro",
+      "run": 2,
+      "error": "HTTP 429"
+    },
+    {
+      "task": "task13",
+      "model": "deepseek-ai/deepseek-v4-pro",
+      "run": 3,
+      "error": "HTTP 429"
+    },
+    {
+      "task": "task14",
+      "model": "deepseek-ai/deepseek-v4-pro",
+      "run": 1,
+      "error": "HTTP 429"
+    },
+    {
+      "task": "task14",
+      "model": "deepseek-ai/deepseek-v4-pro",
+      "run": 2,
+      "error": "HTTP 429"
+    },
+    {
+      "task": "task14",
+      "model": "deepseek-ai/deepseek-v4-pro",
+      "run": 3,
+      "error": "HTTP 429"
+    },
+    {
+      "task": "task15",
+      "model": "deepseek-ai/deepseek-v4-pro",
+      "run": 1,
+      "error": "HTTP 429"
+    },
+    {
+      "task": "task15",
+      "model": "deepseek-ai/deepseek-v4-pro",
+      "run": 2,
+      "error": "HTTP 429"
+    },
+    {
+      "task": "task15",
+      "model": "deepseek-ai/deepseek-v4-pro",
+      "run": 3,
+      "error": "HTTP 429"
+    },
+    {
+      "task": "task16",
+      "model": "deepseek-ai/deepseek-v4-pro",
+      "run": 1,
+      "error": "HTTP 429"
+    },
+    {
+      "task": "task16",
+      "model": "deepseek-ai/deepseek-v4-pro",
+      "run": 2,
+      "error": "HTTP 429"
+    },
+    {
+      "task": "task16",
+      "model": "deepseek-ai/deepseek-v4-pro",
+      "run": 3,
+      "error": "HTTP 429"
+    },
+    {
+      "task": "task17",
+      "model": "deepseek-ai/deepseek-v4-pro",
+      "run": 1,
+      "error": "HTTP 429"
+    },
+    {
+      "task": "task17",
+      "model": "deepseek-ai/deepseek-v4-pro",
+      "run": 2,
+      "error": "HTTP 429"
+    },
+    {
+      "task": "task17",
+      "model": "deepseek-ai/deepseek-v4-pro",
+      "run": 3,
+      "error": "HTTP 429"
+    },
+    {
+      "task": "task18",
+      "model": "deepseek-ai/deepseek-v4-pro",
+      "run": 1,
+      "error": "HTTP 429"
+    },
+    {
+      "task": "task18",
+      "model": "deepseek-ai/deepseek-v4-pro",
+      "run": 2,
+      "error": "HTTP 429"
+    },
+    {
+      "task": "task18",
+      "model": "deepseek-ai/deepseek-v4-pro",
+      "run": 3,
+      "error": "HTTP 429"
+    },
+    {
+      "task": "task19",
+      "model": "deepseek-ai/deepseek-v4-pro",
+      "run": 1,
+      "error": "HTTP 429"
+    },
+    {
+      "task": "task19",
+      "model": "deepseek-ai/deepseek-v4-pro",
+      "run": 2,
+      "error": "HTTP 429"
+    }
+  ],
+  "models": [
+    "deepseek-ai/deepseek-v4-pro",
+    "nvidia/nemotron-3-ultra-550b-a55b",
+    "openai/gpt-oss-120b"
+  ],
+  "tasks": [
+    "task01",
+    "task02",
+    "task03",
+    "task04",
+    "task05",
+    "task06",
+    "task07",
+    "task08",
+    "task09",
+    "task10",
+    "task11",
+    "task12",
+    "task13",
+    "task14",
+    "task15",
+    "task16",
+    "task17",
+    "task18",
+    "task19",
+    "task20"
+  ],
+  "k": 3,
+  "generated_at": "2026-07-20T20:29:18.400288+00:00"
+}

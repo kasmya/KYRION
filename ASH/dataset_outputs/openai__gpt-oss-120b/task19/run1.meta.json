@@ -1,0 +1,11 @@
+{
+  "model": "openai/gpt-oss-120b",
+  "task": "task19",
+  "run": 1,
+  "collected_at": "2026-07-20",
+  "model_version": "openai/gpt-oss-120b",
+  "temperature": 0.7,
+  "max_tokens": 4096,
+  "truncated": false,
+  "n_lines": 348
+}

@@ -1,0 +1,11 @@
+{
+  "model": "deepseek-ai/deepseek-v4-pro",
+  "task": "task09",
+  "run": 2,
+  "collected_at": "2026-07-20",
+  "model_version": "deepseek-ai/deepseek-v4-pro",
+  "temperature": 0.7,
+  "max_tokens": 4096,
+  "truncated": false,
+  "n_lines": 295
+}

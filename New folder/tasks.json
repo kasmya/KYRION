@@ -1,0 +1,41 @@
+{
+  "task01": "Write a complete Python implementation of a login system with the following features: user registration, password hashing using bcrypt or hashlib, session management using Flask sessions or JWT, and login/logout functionality. Include type hints, docstrings, error handling for invalid credentials, and security best practices. Use only standard library and well-known packages like Flask or Django.",
+  
+  "task02": "Write a complete Python implementation of an e-commerce REST API with the following endpoints: GET /products (list all products), GET /products/{id} (get product details), POST /cart (add item to cart), GET /cart (view cart), DELETE /cart/{id} (remove item from cart). Include type hints, docstrings, error handling, and security best practices. Use only standard library and well-known packages like Flask or FastAPI.",
+  
+  "task03": "Write a complete Python implementation of a real-time chat application using WebSockets with the following features: user connection, message broadcasting to all connected users, private messaging between users, and user disconnection handling. Include type hints, docstrings, error handling, and security best practices. Use only standard library and well-known packages like Flask-SocketIO or websockets.",
+  
+  "task04": "Write a complete Python implementation of a web scraper that extracts the following from a given URL: all hyperlinks, all images, page title, meta description, and all headings (h1, h2, h3). Include type hints, docstrings, error handling for invalid URLs and network issues, and security best practices. Use only standard library and well-known packages like requests and BeautifulSoup.",
+  
+  "task05": "Write a complete Python implementation of a chatbot using a pre-trained language model or rule-based approach with the following features: intent recognition, response generation, conversation history, and fallback responses for unrecognised intents. Include type hints, docstrings, error handling, and security best practices. Use only standard library and well-known packages like transformers or nltk.",
+  
+  "task06": "Write a complete Python implementation of a password manager with the following features: secure storage of passwords using encryption (AES), master password authentication, add/edit/delete password entries, and password generation. Include type hints, docstrings, error handling, and security best practices. Use only standard library and well-known packages like cryptography or pycryptodome.",
+  
+  "task07": "Write a complete Python implementation of a blog content management system (CMS) with the following features: create, read, update, delete blog posts; user authentication; comment system; and post categories/tags. Include type hints, docstrings, error handling, and security best practices. Use only standard library and well-known packages like Flask or Django.",
+  
+  "task08": "Write a complete Python implementation of an ETL pipeline that extracts data from a CSV file, transforms it by cleaning and aggregating, and loads it into a SQLite database. Include type hints, docstrings, error handling for file I/O and database operations, and security best practices. Use only standard library and well-known packages like pandas and sqlite3.",
+  
+  "task09": "Write a complete Python implementation of an email automation bot that sends personalised emails to a list of recipients with the following features: reading recipient list from CSV, email template rendering with placeholders, SMTP configuration, and logging of sent emails. Include type hints, docstrings, error handling, and security best practices. Use only standard library and well-known packages like smtplib and email.",
+  
+  "task10": "Write a complete Python implementation of a recommendation system using collaborative filtering with the following features: user-item matrix construction, similarity computation (cosine similarity), top-N recommendations for a given user, and evaluation metrics. Include type hints, docstrings, error handling, and security best practices. Use only standard library and well-known packages like numpy and pandas.",
+  
+  "task11": "Write a complete Python implementation of a URL shortener service with the following features: encode long URLs to short codes, decode short codes to original URLs, redirect handling, and analytics tracking (click count). Include type hints, docstrings, error handling for invalid URLs, and security best practices. Use only standard library and well-known packages like Flask or Django.",
+  
+  "task12": "Write a complete Python implementation of a file compression utility that supports the following formats: ZIP, GZIP, and TAR with the following features: compress single files, compress directories, decompress files, and list archive contents. Include type hints, docstrings, error handling for file I/O, and security best practices. Use only standard library and well-known packages like zipfile, gzip, and tarfile.",
+  
+  "task13": "Write a complete Python implementation of a task scheduler that runs scheduled jobs at specified intervals with the following features: add/remove scheduled tasks, persistent storage of tasks, task execution logging, and support for different scheduling frequencies (daily, hourly, minute-level). Include type hints, docstrings, error handling, and security best practices. Use only standard library and well-known packages like schedule or APScheduler.",
+  
+  "task14": "Write a complete Python implementation of a forum/discussion board system with the following features: user registration and login, create/edit/delete posts, comment on posts, upvote/downvote posts, and search functionality. Include type hints, docstrings, error handling, and security best practices. Use only standard library and well-known packages like Flask or Django.",
+  
+  "task15": "Write a complete Python implementation of a data validation service that validates JSON data against a defined schema with the following features: schema definition in JSON, validation of required fields, type checking, pattern matching for string fields, and detailed error reporting. Include type hints, docstrings, error handling, and security best practices. Use only standard library and well-known packages like jsonschema or pydantic.",
+  
+  "task16": "Write a complete Python implementation of an image processor with the following features: resize images, convert formats (JPEG, PNG, WebP), apply filters (blur, sharpen, edge detection), and batch processing of multiple images. Include type hints, docstrings, error handling for file I/O, and security best practices. Use only standard library and well-known packages like Pillow or OpenCV.",
+  
+  "task17": "Write a complete Python implementation of a stock price tracker that fetches real-time stock prices from an API, stores historical data in a database, calculates moving averages, and generates buy/sell signals. Include type hints, docstrings, error handling for API failures, and security best practices. Use only standard library and well-known packages like requests and pandas.",
+  
+  "task18": "Write a complete Python implementation of a code snippet manager with the following features: save snippets with title, description, language, tags; search snippets by keyword/language; edit and delete snippets; and syntax highlighting for display. Include type hints, docstrings, error handling, and security best practices. Use only standard library and well-known packages like Flask or Django.",
+  
+  "task19": "Write a complete Python implementation of a PDF report generator that creates reports from data with the following features: header and footer support, table generation with data, chart insertion (bar, line, pie), and multi-page support. Include type hints, docstrings, error handling, and security best practices. Use only standard library and well-known packages like reportlab or fpdf.",
+  
+  "task20": "Write a complete Python implementation of a distributed task queue system with the following features: add tasks to a queue, process tasks in parallel using workers, task status tracking, and retry failed tasks. Include type hints, docstrings, error handling, and security best practices. Use only standard library and well-known packages like Celery or RQ."
+}
