@@ -153,8 +153,8 @@ KYRION/
 ├── _excluded_models/              # Models excluded from the final dataset (kept for transparency)
 ├── _excluded_parsefail/           # Samples that failed to parse, quarantined rather than silently dropped
 │
-├── generate_paper_figures.ipynb / generate_paper_figures_v4.ipynb
-├── paper_figures/                 # Exported figure PNGs + notebook
+├── paper_figures/                 # fig1_performance.png, fig2_signatures.png,
+│                                   #   generate_figures.ipynb (regenerates both + LaTeX tables)
 ├── paper/                         # IEEE submission PDFs
 └── README.md
 ```
