@@ -10,7 +10,7 @@ It auto-reads the CSVs you've generated and fills in the real numbers where it c
 so the table is pre-populated with your actual results.
 
 USAGE:
-    python3 phase3_claims_table.py
+    python3 scripts/analysis/phase3_claims_table.py
 Writes research/data/claims_evidence.md (the table) — review it before writing.
 """
 from __future__ import annotations

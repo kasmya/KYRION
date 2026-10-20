@@ -11,12 +11,12 @@ Two phases:
   2. audit: run KYRION over the completions and report per-model Trust/Quality/
      security/hallucination/style/dead-code + a Kruskal-Wallis test.
 
-USAGE:
+USAGE (run from the repo root):
   # generate (needs api_config.py with your keys, like the main generator)
-  python3 humaneval_completions.py --mode generate --k 1 --limit 40
+  python3 scripts/generation/humaneval_completions.py --mode generate --k 1 --limit 40
 
   # audit whatever has been generated
-  python3 humaneval_completions.py --mode audit
+  python3 scripts/generation/humaneval_completions.py --mode audit
 
 Reuses your existing api_config.py (MODEL_CONFIGS, NVIDIA_BASE_URL) so the same
 keys/models are used. Keep --limit modest first; 164 x 5 models is a lot of calls.
@@ -25,7 +25,9 @@ from __future__ import annotations
 import argparse, glob, json, re, sys
 from pathlib import Path
 
-sys.path.insert(0, str(Path(__file__).parent / "src"))
+ROOT = Path(__file__).resolve().parents[2]
+sys.path.insert(0, str(ROOT / "src"))
+sys.path.insert(0, str(ROOT))
 from auditor import AIAuditor
 from quality import analyze_code_quality
 from hallucination import detect_hallucinations

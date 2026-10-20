@@ -18,8 +18,8 @@ Produces two things:
      instruction-adherence detection that the others lack.
 
 USAGE:
-    python3 phase5_tool_comparison.py                 # full corpus
-    python3 phase5_tool_comparison.py --limit 30      # quick subset
+    python3 scripts/analysis/phase5_tool_comparison.py                 # full corpus
+    python3 scripts/analysis/phase5_tool_comparison.py --limit 30      # quick subset
 Writes research/data/tool_comparison.csv and prints a LaTeX capability table.
 
 Requires: pip install bandit ruff pylint
@@ -28,7 +28,7 @@ from __future__ import annotations
 import argparse, glob, json, subprocess, sys, tempfile
 from pathlib import Path
 
-sys.path.insert(0, str(Path(__file__).parent / "src"))
+sys.path.insert(0, str(Path(__file__).resolve().parents[2] / "src"))
 from hallucination import detect_hallucinations   # noqa: E402
 from quality import analyze_code_quality          # noqa: E402
 from instruction import audit_instruction_adherence  # noqa: E402

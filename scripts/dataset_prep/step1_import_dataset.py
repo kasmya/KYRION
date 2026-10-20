@@ -10,8 +10,8 @@ Also writes a run<K>.meta.json beside each file with provenance pulled from
 provenance.jsonl (model version, collected_at) so the dataset is citable.
 
 USAGE (edit the two paths at the top if yours differ):
-    python3 step1_import_dataset.py
-    python3 step1_import_dataset.py --dry-run     # preview only
+    python3 scripts/dataset_prep/step1_import_dataset.py
+    python3 scripts/dataset_prep/step1_import_dataset.py --dry-run     # preview only
 """
 from __future__ import annotations
 import argparse, json, shutil

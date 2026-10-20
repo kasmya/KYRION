@@ -9,7 +9,7 @@ Generate the paper's core exhibits from the frozen results:
 These are the skeleton the Results prose wraps around — build them first.
 
 USAGE:
-    python3 phase4_paper_exhibits.py
+    python3 scripts/analysis/phase4_paper_exhibits.py
 Writes to research/data/paper_exhibits/:
     master_results_table.tex
     significance_summary.tex

@@ -14,9 +14,9 @@ Also lets you drop models that barely generated (e.g. mistral) so they don't
 pollute the stats.
 
 USAGE:
-    python3 step1b_fix_duplicates.py --dry-run
-    python3 step1b_fix_duplicates.py
-    python3 step1b_fix_duplicates.py --drop mistralai__mistral-large-3-675b-instruct-2512
+    python3 scripts/dataset_prep/step1b_fix_duplicates.py --dry-run
+    python3 scripts/dataset_prep/step1b_fix_duplicates.py
+    python3 scripts/dataset_prep/step1b_fix_duplicates.py --drop mistralai__mistral-large-3-675b-instruct-2512
 """
 from __future__ import annotations
 import argparse, re, shutil

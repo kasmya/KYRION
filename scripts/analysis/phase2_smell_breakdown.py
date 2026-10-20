@@ -16,7 +16,7 @@ Smell types tracked (from quality.py):
   - TODO/FIXME markers
 
 USAGE:
-    python3 phase2_smell_breakdown.py
+    python3 scripts/analysis/phase2_smell_breakdown.py
 Writes research/data/smell_breakdown.csv (per-model mean count per smell type)
 and prints a significance test for each type.
 """
@@ -26,7 +26,7 @@ from collections import defaultdict
 from pathlib import Path
 import sys
 
-sys.path.insert(0, str(Path(__file__).parent / "src"))
+sys.path.insert(0, str(Path(__file__).resolve().parents[2] / "src"))
 from quality import analyze_code_quality  # noqa: E402
 import numpy as np
 from scipy import stats

@@ -3,8 +3,8 @@ Recompute per-generation stylistic smell flags directly from run*.py files
 using the project's own src/quality.py logic, then run Friedman + pairwise
 Wilcoxon (Holm-corrected) on the task x model matrices.
 
-Run this from the repo root: ~/downloads/kyrion
-    python3 stylistic_friedman.py
+Run this from the repo root:
+    python3 scripts/pipeline/stylistic_friedman.py
 """
 import ast
 import glob
@@ -13,12 +13,14 @@ import re
 import sys
 from collections import defaultdict
 from itertools import combinations
+from pathlib import Path
 
 import pandas as pd
 import numpy as np
 from scipy.stats import friedmanchisquare, wilcoxon
 
-sys.path.insert(0, os.path.join(os.path.dirname(__file__), "src"))
+ROOT = Path(__file__).resolve().parents[2]
+sys.path.insert(0, str(ROOT / "src"))
 
 LONG_FUNCTION_LINES = 50
 LONG_LINE_CHARS = 120
@@ -164,8 +166,9 @@ def main():
     for metric, n, stat, p in results_summary:
         print(f"{metric:28s} {n:4d} {stat:8.3f} {p:12.3e}")
 
-    task_level.to_csv("stylistic_task_level_recomputed.csv", index=False)
-    print("\nSaved: stylistic_task_level_recomputed.csv")
+    out_path = ROOT / "research" / "data" / "stylistic_task_level_recomputed.csv"
+    task_level.to_csv(out_path, index=False)
+    print(f"\nSaved: {out_path}")
 
 
 if __name__ == "__main__":

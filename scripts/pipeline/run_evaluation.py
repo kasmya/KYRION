@@ -17,8 +17,8 @@ Reads the canonical structure:  research/samples/<model>/task<NN>/run<K>.py
 Empty placeholder run files (not yet collected) are skipped and reported.
 
 USAGE
-    python3 run_evaluation.py
-    python3 run_evaluation.py --runs-out research/data/results_runs.csv \
+    python3 scripts/pipeline/run_evaluation.py
+    python3 scripts/pipeline/run_evaluation.py --runs-out research/data/results_runs.csv \
                               --cell-out research/data/results.csv
 """
 from __future__ import annotations
@@ -32,12 +32,12 @@ import statistics
 import sys
 from pathlib import Path
 
-sys.path.insert(0, str(Path(__file__).parent / "src"))
+sys.path.insert(0, str(Path(__file__).resolve().parents[2] / "src"))
 from auditor import AIAuditor            # noqa: E402
 from quality import analyze_code_quality  # noqa: E402
 from hallucination import detect_hallucinations  # noqa: E402
 
-ROOT = Path(__file__).parent
+ROOT = Path(__file__).resolve().parents[2]
 SAMPLES = ROOT / "research" / "samples"
 
 # metrics we aggregate across runs

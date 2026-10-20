@@ -6,8 +6,8 @@ models exist under research/samples/ (no hardcoded model list), so it works with
 your NVIDIA models directly.
 
 USAGE:
-    python3 step2_status.py            # target k=3
-    python3 step2_status.py --k 3
+    python3 scripts/dataset_prep/step2_status.py            # target k=3
+    python3 scripts/dataset_prep/step2_status.py --k 3
 """
 import argparse, re
 from pathlib import Path

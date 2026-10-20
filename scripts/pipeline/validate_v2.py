@@ -4,16 +4,16 @@ Builds a properly-sized labelled test set from ALL clean corpus files and
 computes precision/recall/F1 against known ground truth.
 
 Run from the KYRION root:
-    python3 validate_v2.py --n-positive 60 --seed 42
+    python3 scripts/pipeline/validate_v2.py --n-positive 60 --seed 42
 """
 from __future__ import annotations
 import argparse, glob, random, sys
 from pathlib import Path
 
-sys.path.insert(0, str(Path(__file__).parent / "src"))
+sys.path.insert(0, str(Path(__file__).resolve().parents[2] / "src"))
 from hallucination import detect_hallucinations
 
-SAMPLES = Path(__file__).parent / "research" / "samples"
+SAMPLES = Path(__file__).resolve().parents[2] / "research" / "samples"
 
 # Realistic typosquats (hard positives) — do not exist on PyPI => hallucination.
 TYPOSQUATS = [

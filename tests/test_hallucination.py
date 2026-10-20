@@ -140,7 +140,7 @@ def test_detector_meets_precision_recall_floor():
     from pathlib import Path as _P
     root = _P(__file__).parent.parent
     # import the harness directly for speed
-    _sys.path.insert(0, str(root))
+    _sys.path.insert(0, str(root / "scripts" / "pipeline"))
     import validate_detector as vd
     dataset = vd.build_dataset(n_positive=40, seed=42)
     m = vd.evaluate(dataset)

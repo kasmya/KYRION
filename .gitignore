@@ -12,3 +12,5 @@ venv/
 htmlcov/
 anaconda_projects/
 .env
+
+.ruff_cache/

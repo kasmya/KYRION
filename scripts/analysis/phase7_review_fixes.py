@@ -12,7 +12,7 @@ Zero-new-data analyses for reviewer items #3 and #6. Runs on CSVs you already ha
      are stable.
 
 USAGE:
-    python3 phase7_review_fixes.py
+    python3 scripts/analysis/phase7_review_fixes.py
 Reads research/data/results_runs.csv (per-run) — no new generation needed.
 """
 import csv, statistics

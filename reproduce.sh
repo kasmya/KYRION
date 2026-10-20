@@ -23,13 +23,13 @@ echo "==> [2/5] Running test suite (detectors must be correct before scoring)"
 python3 -m pytest tests/ -q
 
 echo "==> [3/5] Auditing all 100 samples -> research/data/results.csv"
-python3 run_evaluation.py
+python3 scripts/pipeline/run_evaluation.py
 
 echo "==> [4/5] Weight-sensitivity sweep -> research/data/weight_sensitivity.csv"
-python3 weight_sensitivity.py
+python3 scripts/pipeline/weight_sensitivity.py
 
 echo "==> [5/6] Ground-truth detector validation"
-python3 validate_detector.py
+python3 scripts/pipeline/validate_detector.py
 
 echo "==> [6/6] Model-comparison analysis (paper's per-model table)"
 python3 research/analysis/compare_models.py || {

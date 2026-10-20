@@ -16,8 +16,8 @@ OUTPUTS:
     which run_evaluation / stats can honor.
 
 USAGE:
-    python3 step3_quality_gate.py --min-k 2
-    python3 step3_quality_gate.py --min-k 2 --drop-model deepseek-ai__deepseek-v4-flash
+    python3 scripts/dataset_prep/step3_quality_gate.py --min-k 2
+    python3 scripts/dataset_prep/step3_quality_gate.py --min-k 2 --drop-model deepseek-ai__deepseek-v4-flash
 """
 from __future__ import annotations
 import argparse, ast, json, re

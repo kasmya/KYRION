@@ -99,9 +99,9 @@ bash reproduce.sh
 This runs, in order:
 1. Install pinned dependencies
 2. Run the detector test suite (`pytest tests/`) — must pass before any score is trusted
-3. Audit every sample → `research/data/results.csv` and `results_runs.csv` (`run_evaluation.py`)
-4. Run the Trust Score weight-sensitivity sweep (`weight_sensitivity.py`)
-5. Validate the hallucination detector against labelled ground truth (`validate_detector.py`)
+3. Audit every sample → `research/data/results.csv` and `results_runs.csv` (`scripts/pipeline/run_evaluation.py`)
+4. Run the Trust Score weight-sensitivity sweep (`scripts/pipeline/weight_sensitivity.py`)
+5. Validate the hallucination detector against labelled ground truth (`scripts/pipeline/validate_detector.py`)
 6. Run the per-model comparison analysis (`research/analysis/compare_models.py`)
 
 ### Generating new samples
@@ -113,14 +113,14 @@ export NVIDIA_KEY_DEEPSEEK_PRO=...
 export NVIDIA_KEY_QWEN35=...
 export NVIDIA_KEY_NEMOTRON_ULTRA=...
 export NVIDIA_KEY_GPTOSS=...
-python3 humaneval_completions.py
+python3 scripts/generation/humaneval_completions.py --mode generate --k 1 --limit 40
 ```
 
 `api_config.py` reads every key from an environment variable with **no literal fallback** — it raises a clear error if a key is missing rather than silently using a hardcoded value. Never commit real keys into this file.
 
 ### Supplementary analysis phases
 
-Phases 2–7b (`phase2_smell_breakdown.py` … `phase7b_failure_oracle.py`) and the `step1_*`–`step3_*`/`validate_*`/`stylistic_*` scripts are additional analyses written in response to specific reviewer questions (smell-type breakdown, claims-to-evidence traceability, multiple-comparisons correction, parse-failure attribution, etc.). Each file's module docstring explains which question it answers; run them individually once the core `reproduce.sh` pipeline has produced `research/data/results*.csv`.
+[`scripts/analysis/`](scripts/analysis) (`phase2_smell_breakdown.py` … `phase7b_failure_oracle.py`) and [`scripts/dataset_prep/`](scripts/dataset_prep) / the `validate_*`/`stylistic_*` scripts in [`scripts/pipeline/`](scripts/pipeline) are additional analyses written in response to specific reviewer questions (smell-type breakdown, claims-to-evidence traceability, multiple-comparisons correction, parse-failure attribution, etc.). Each file's module docstring explains which question it answers and gives its exact invocation; run them individually once the core `reproduce.sh` pipeline has produced `research/data/results*.csv`.
 
 ---
 
@@ -128,30 +128,30 @@ Phases 2–7b (`phase2_smell_breakdown.py` … `phase7b_failure_oracle.py`) and 
 
 ```
 KYRION/
-├── cli.py                     # Single-file CLI entrypoint
-├── src/                        # Core detectors (hallucination, instruction, quality, auditor, report, exporters)
-├── tests/                      # Detector unit tests
-├── examples/                   # Sample good/bad AI-generated code for manual testing
-├── auditor.yaml                # Trust Score weights & quality-penalty config
+├── cli.py                        # Single-file CLI entrypoint
+├── api_config.py                 # NVIDIA NIM key config (env-vars only, no secrets committed)
+├── auditor.yaml                  # Trust Score weights & quality-penalty config
+├── reproduce.sh                  # End-to-end reproduction of every paper result
 ├── requirements.txt / pyproject.toml
 │
-├── research/
-│   ├── samples/                 # research/samples/<model>/task<NN>/run<K>.py — the benchmark corpus
-│   ├── data/                    # Generated CSVs (results, stats, smell breakdowns)
-│   └── analysis/                # compare_models.py, graphs.py, analyze.py
-├── dataset_outputs/              # Raw per-task model outputs as originally collected
-├── _excluded_models/             # Models excluded from the final dataset (kept for transparency)
-├── _excluded_parsefail/          # Samples that failed to parse, quarantined rather than silently dropped
+├── src/                           # Core detectors (hallucination, instruction, quality, auditor, report, exporters)
+├── tests/                         # Detector unit tests
+├── examples/                      # Sample good/bad AI-generated code for manual testing
 │
-├── run_evaluation.py             # Batch-audits every sample -> results.csv / results_runs.csv
-├── weight_sensitivity.py         # Trust Score weight-sensitivity sweep
-├── validate_detector.py / validate_v2.py   # Hallucination detector precision/recall validation
-├── stats_analysis.py / stylistic_friedman.py / stylistic_task_level_recomputed.csv
-├── phase2_smell_breakdown.py … phase7b_failure_oracle.py   # Reviewer-response analyses
-├── step1_import_dataset.py … step3_quality_gate.py          # Dataset intake / QA scripts
-├── humaneval_completions.py       # Optional: generate + audit HumanEval completions
-├── api_config.py                  # NVIDIA NIM key config (env-vars only, no secrets committed)
-├── reproduce.sh                   # End-to-end reproduction of every paper result
+├── scripts/
+│   ├── pipeline/                   # Core reproduce.sh steps: run_evaluation, weight_sensitivity,
+│   │                                #   validate_detector/v2, stats_analysis, stylistic_friedman
+│   ├── analysis/                   # phase2_smell_breakdown.py … phase7b_failure_oracle.py (reviewer-response analyses)
+│   ├── dataset_prep/                # step1_import_dataset.py … step3_quality_gate.py (dataset intake / QA)
+│   └── generation/                  # humaneval_completions.py (optional: generate + audit HumanEval completions)
+│
+├── research/
+│   ├── samples/                  # research/samples/<model>/task<NN>/run<K>.py — the benchmark corpus
+│   ├── data/                     # Generated CSVs (results, stats, smell breakdowns)
+│   └── analysis/                 # compare_models.py, graphs.py, analyze.py
+├── dataset_outputs/               # Raw per-task model outputs as originally collected
+├── _excluded_models/              # Models excluded from the final dataset (kept for transparency)
+├── _excluded_parsefail/           # Samples that failed to parse, quarantined rather than silently dropped
 │
 ├── generate_paper_figures.ipynb / generate_paper_figures_v4.ipynb
 ├── paper_figures/                 # Exported figure PNGs + notebook

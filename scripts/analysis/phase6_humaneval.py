@@ -22,10 +22,10 @@ report the correlation between Trust Score and pass rate.
 
 USAGE:
     # audit canonical solutions only (no execution) -- safe, fast
-    python3 phase6_humaneval.py --mode audit
+    python3 scripts/analysis/phase6_humaneval.py --mode audit
 
     # audit + execute tests to get correctness labels (runs code in a subprocess)
-    python3 phase6_humaneval.py --mode validate --limit 50
+    python3 scripts/analysis/phase6_humaneval.py --mode validate --limit 50
 
 SAFETY: executing benchmark code runs third-party code. We run each problem in a
 separate subprocess with a timeout. Use --mode audit if you don't want execution.
@@ -36,7 +36,7 @@ from __future__ import annotations
 import argparse, json, subprocess, sys, tempfile
 from pathlib import Path
 
-sys.path.insert(0, str(Path(__file__).parent / "src"))
+sys.path.insert(0, str(Path(__file__).resolve().parents[2] / "src"))
 from auditor import AIAuditor                    # noqa: E402
 from quality import analyze_code_quality         # noqa: E402
 from hallucination import detect_hallucinations  # noqa: E402

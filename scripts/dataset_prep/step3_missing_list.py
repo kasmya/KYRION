@@ -7,8 +7,8 @@ those with your NVIDIA generator instead of re-running everything.
 Reads provenance.jsonl if present (authoritative), else infers from files on disk.
 
 USAGE:
-    python3 step3_missing_list.py --k 3
-    python3 step3_missing_list.py --k 3 --models-out retry_models.txt
+    python3 scripts/dataset_prep/step3_missing_list.py --k 3
+    python3 scripts/dataset_prep/step3_missing_list.py --k 3 --models-out retry_models.txt
 """
 import argparse, json, re
 from pathlib import Path

@@ -24,8 +24,8 @@ confusion matrix at the FILE level (a file is "predicted hallucination" iff the
 detector reports >=1 true hallucination).
 
 USAGE
-    python3 validate_detector.py
-    python3 validate_detector.py --n-positive 40 --seed 42
+    python3 scripts/pipeline/validate_detector.py
+    python3 scripts/pipeline/validate_detector.py --n-positive 40 --seed 42
 
 Deterministic given the seed, so the reported precision/recall are reproducible
 and citable in the paper.
@@ -40,10 +40,10 @@ import string
 import sys
 from pathlib import Path
 
-sys.path.insert(0, str(Path(__file__).parent / "src"))
+sys.path.insert(0, str(Path(__file__).resolve().parents[2] / "src"))
 from hallucination import detect_hallucinations  # noqa: E402
 
-SAMPLES_ROOT = Path(__file__).parent / "research" / "samples"
+SAMPLES_ROOT = Path(__file__).resolve().parents[2] / "research" / "samples"
 
 
 def _random_fake_module(rng: random.Random) -> str:
@@ -170,7 +170,7 @@ def main() -> int:
 
     # persist for the paper appendix
     import csv as _csv
-    out = Path(__file__).parent / "research" / "data" / "detector_validation.csv"
+    out = Path(__file__).resolve().parents[2] / "research" / "data" / "detector_validation.csv"
     out.parent.mkdir(parents=True, exist_ok=True)
     with open(out, "w", newline="", encoding="utf-8") as fh:
         w = _csv.writer(fh)

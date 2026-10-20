@@ -18,11 +18,11 @@ assumed. Kruskal-Wallis + Mann-Whitney + Cliff's delta make no normality assumpt
 and are the standard defensible choice for this design.
 
 USAGE:
-    python3 stats_analysis.py                       # metric = trust_score
-    python3 stats_analysis.py --metric quality_score
-    python3 stats_analysis.py --metric hallucination_count
-    python3 stats_analysis.py --unit run            # per-run (default)
-    python3 stats_analysis.py --unit cell           # per-cell means (task-level)
+    python3 scripts/pipeline/stats_analysis.py                       # metric = trust_score
+    python3 scripts/pipeline/stats_analysis.py --metric quality_score
+    python3 scripts/pipeline/stats_analysis.py --metric hallucination_count
+    python3 scripts/pipeline/stats_analysis.py --unit run            # per-run (default)
+    python3 scripts/pipeline/stats_analysis.py --unit cell           # per-cell means (task-level)
 
 Writes a CSV of pairwise results to research/data/stats_<metric>.csv.
 """

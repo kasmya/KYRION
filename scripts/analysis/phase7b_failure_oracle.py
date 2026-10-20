@@ -12,7 +12,7 @@ Runs on files you already have — no new generation.
       eyeball staleness risk.
 
 USAGE:
-    python3 phase7b_failure_oracle.py
+    python3 scripts/analysis/phase7b_failure_oracle.py
 """
 import glob, json, ast
 from pathlib import Path

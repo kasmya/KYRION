@@ -19,8 +19,8 @@ WHAT IT DOES
        induced ranking, so you can state precisely whether conclusions hold.
 
 USAGE
-    python3 weight_sensitivity.py
-    python3 weight_sensitivity.py --step 0.25    # coarser/finer grid
+    python3 scripts/pipeline/weight_sensitivity.py
+    python3 scripts/pipeline/weight_sensitivity.py --step 0.25    # coarser/finer grid
 
 Output is deterministic given the samples, so the numbers are reproducible and
 citable. Save the printed table to research/data/weight_sensitivity.csv for the
@@ -34,10 +34,10 @@ import os
 import sys
 from pathlib import Path
 
-sys.path.insert(0, str(Path(__file__).parent / "src"))
+sys.path.insert(0, str(Path(__file__).resolve().parents[2] / "src"))
 from auditor import AIAuditor  # noqa: E402
 
-SAMPLES_ROOT = Path(__file__).parent / "research" / "samples"
+SAMPLES_ROOT = Path(__file__).resolve().parents[2] / "research" / "samples"
 
 
 def _load_samples():
@@ -129,7 +129,7 @@ def main() -> int:
 
     # --- write CSV for the paper appendix ---
     import csv as _csv
-    out = Path(__file__).parent / args.csv
+    out = Path(__file__).resolve().parents[2] / args.csv
     out.parent.mkdir(parents=True, exist_ok=True)
     with open(out, "w", newline="", encoding="utf-8") as fh:
         writer = _csv.DictWriter(fh, fieldnames=list(csv_rows[0].keys()))
